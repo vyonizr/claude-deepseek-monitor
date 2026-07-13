@@ -73,7 +73,10 @@
       // Drag via Tauri's built-in startDragging — zero IPC, native OS drag loop
       document.getElementById('titlebar').addEventListener('mousedown', function(e) {
         if (e.button !== 0) return;
-        win.startDragging();
+        win.startDragging().catch(function(err) {
+          document.getElementById('diagnostic').textContent = 'Drag error: ' + err;
+          document.getElementById('diagnostic').style.display = 'block';
+        });
         e.preventDefault();
       });
 

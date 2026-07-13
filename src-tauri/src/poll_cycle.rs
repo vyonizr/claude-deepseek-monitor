@@ -100,7 +100,7 @@ fn parse_claude_usage_text(text: &str) -> Option<(f64, String, f64, String)> {
             if let Some(reset) = extract_reset_time(line) {
                 session_reset = Some(reset);
             }
-        } else if line.starts_with("Current week") {
+        } else if line.starts_with("Current week (all models):") {
             if let Some(pct) = extract_percentage(line) {
                 week_pct = Some(pct);
             }
@@ -301,7 +301,7 @@ pub fn poll_cycle(
             (Some(start), Some(reset)) if start < reset => {
                 let total_dur = reset - start;
                 let elapsed = *current_time - start;
-                if total_dur.num_seconds() > 0 && elapsed.num_seconds() > 0 {
+                if total_dur.num_seconds() > 0 {
                     let elapsed_pct = (elapsed.num_seconds() as f64 / total_dur.num_seconds() as f64) * 100.0;
                     Some(compute_pacing(sp, elapsed_pct))
                 } else {
@@ -408,6 +408,18 @@ mod tests {
         assert!(sr.contains("Jul 13"), "sr '{sr}' should contain 'Jul 13'");
         assert_eq!(wp, 13.0, "week pct should be 13, got {wp}");
         assert!(wr.contains("Jul 18"), "wr '{wr}' should contain 'Jul 18'");
+    }
+
+    const FABLE_USAGE_TEXT: &str = "Current session: 3% used \u{00b7} resets Jul 14, 2:10am (Asia/Jakarta)\nCurrent week (all models): 14% used \u{00b7} resets Jul 18, 4am (Asia/Jakarta)\nCurrent week (Fable): 0% used";
+
+    #[test]
+    fn test_parse_usage_with_fable_line() {
+        let result = parse_claude_usage_text(FABLE_USAGE_TEXT);
+        assert!(result.is_some(), "should parse despite Fable line");
+        let (sp, sr, wp, wr) = result.unwrap();
+        assert_eq!(sp, 3.0, "session pct should be 3, got {sp}");
+        assert_eq!(wp, 14.0, "week pct should be 14 (all models), got {wp} — Fable line overwrote it");
+        assert!(wr.contains("Jul 18"), "week reset should be Jul 18, got '{wr}'");
     }
 
     #[test]

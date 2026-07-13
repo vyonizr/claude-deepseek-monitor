@@ -13,6 +13,7 @@ use tauri_plugin_autostart::ManagerExt;
 
 pub struct AppState {
     pub poll_cycle_state: poll_cycle::DisplayState,
+    pub consecutive_failures: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -196,7 +197,9 @@ fn run_claude_command() -> Result<String, String> {
     cmd
 }
 
-fn run_poll_cycle(app: &tauri::AppHandle) {
+/// Runs one poll cycle and returns whether it succeeded (used by the poll
+/// loop to decide whether to apply backoff before the next attempt).
+fn run_poll_cycle(app: &tauri::AppHandle) -> bool {
     eprintln!("[monitor] run_poll_cycle starting");
 
     let local_now = chrono::Local::now();
@@ -263,6 +266,13 @@ fn run_poll_cycle(app: &tauri::AppHandle) {
         new_state.diagnostic = Some(diag);
     }
 
+    let succeeded = new_state.diagnostic.is_none();
+    state_lock.consecutive_failures = if succeeded {
+        0
+    } else {
+        state_lock.consecutive_failures + 1
+    };
+
     let display_state = new_state.clone();
     state_lock.poll_cycle_state = new_state;
     drop(state_lock);
@@ -272,6 +282,7 @@ fn run_poll_cycle(app: &tauri::AppHandle) {
     fire_notifications(app, &events);
     emit_state_update(app, &display_state);
     eprintln!("[monitor] run_poll_cycle done");
+    succeeded
 }
 
 #[tauri::command]
@@ -341,7 +352,9 @@ pub fn run() {
         ))
         .manage(Mutex::new(AppState {
             poll_cycle_state: poll_cycle::DisplayState::default(),
+            consecutive_failures: 0,
         }))
+        .manage(Mutex::new(None::<PollThreadControl>))
         .invoke_handler(tauri::generate_handler![get_settings, save_settings, get_initial_state])
         .setup(|app| {
             let icon_image = Image::from_bytes(include_bytes!("../icons/32x32.png"))
@@ -396,6 +409,7 @@ pub fn run() {
                         .build();
                     }
                     "quit" => {
+                        signal_poll_thread_shutdown(app);
                         app.exit(0);
                     }
                     _ => {}
@@ -405,22 +419,65 @@ pub fn run() {
             // Run initial poll
             run_poll_cycle(app.handle());
 
-            // Start polling loop
+            // Start polling loop. A shutdown channel lets us interrupt the
+            // sleep immediately on quit instead of waiting out the (possibly
+            // backed-off) interval. The done channel lets the shutdown
+            // trigger block briefly for confirmation that the loop actually
+            // exited, rather than firing-and-forgetting the signal while the
+            // process dies out from under the thread anyway.
+            let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            *app.state::<Mutex<Option<PollThreadControl>>>()
+                .lock()
+                .unwrap() = Some(PollThreadControl { shutdown_tx, done_rx });
+
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 loop {
                     let interval_minutes = load_settings(&handle).poll_interval_minutes.max(1);
-                    std::thread::sleep(Duration::from_secs(interval_minutes as u64 * 60));
-                    run_poll_cycle(&handle);
+                    let base_secs = interval_minutes as u64 * 60;
+                    let failures = handle
+                        .state::<Mutex<AppState>>()
+                        .lock()
+                        .unwrap()
+                        .consecutive_failures;
+                    let delay = poll_cycle::next_poll_delay_secs(base_secs, failures);
+
+                    match shutdown_rx.recv_timeout(Duration::from_secs(delay)) {
+                        Ok(()) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            run_poll_cycle(&handle);
+                        }
+                    }
                 }
+                eprintln!("[monitor] poll thread shutting down");
+                let _ = done_tx.send(());
             });
 
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app_handle, event| {
+        .run(|app_handle, event| {
             if let tauri::RunEvent::ExitRequested { .. } = event {
+                signal_poll_thread_shutdown(app_handle);
             }
         });
+}
+
+struct PollThreadControl {
+    shutdown_tx: std::sync::mpsc::Sender<()>,
+    done_rx: std::sync::mpsc::Receiver<()>,
+}
+
+/// Signals the poll thread to stop and blocks briefly (bounded, so a stuck
+/// subprocess can't hang app exit) for confirmation that it actually did.
+fn signal_poll_thread_shutdown(app: &tauri::AppHandle) {
+    let state = app.state::<Mutex<Option<PollThreadControl>>>();
+    let guard = state.lock().unwrap();
+    if let Some(control) = guard.as_ref() {
+        let _ = control.shutdown_tx.send(());
+        let _ = control.done_rx.recv_timeout(Duration::from_secs(2));
+    }
 }

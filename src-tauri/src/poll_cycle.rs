@@ -180,6 +180,21 @@ fn compute_pacing(used_pct: f64, elapsed_pct: f64) -> Pacing {
     }
 }
 
+/// Backoff multiplier caps growth so a persistently broken `claude` subprocess
+/// doesn't push the poll interval out indefinitely.
+const MAX_BACKOFF_MULTIPLIER: u64 = 8;
+
+/// Computes the delay before the next poll attempt, doubling on each
+/// consecutive failure and capping at `MAX_BACKOFF_MULTIPLIER` × the
+/// user-configured interval. Resets to the base interval once failures clear.
+pub fn next_poll_delay_secs(base_interval_secs: u64, consecutive_failures: u32) -> u64 {
+    if consecutive_failures == 0 {
+        return base_interval_secs;
+    }
+    let multiplier = 2u64.saturating_pow(consecutive_failures.min(10));
+    base_interval_secs.saturating_mul(multiplier.min(MAX_BACKOFF_MULTIPLIER))
+}
+
 fn beijing_offset() -> FixedOffset {
     FixedOffset::east_opt(8 * 3600).expect("UTC+8 is valid")
 }
@@ -483,6 +498,23 @@ mod tests {
         assert!(display.stale);
         assert_eq!(display.session_used_pct, Some(8.0));
         assert_eq!(display.week_used_pct, Some(13.0));
+    }
+
+    #[test]
+    fn test_poll_delay_no_failures_uses_base_interval() {
+        assert_eq!(next_poll_delay_secs(300, 0), 300);
+    }
+
+    #[test]
+    fn test_poll_delay_doubles_per_failure() {
+        assert_eq!(next_poll_delay_secs(300, 1), 600);
+        assert_eq!(next_poll_delay_secs(300, 2), 1200);
+    }
+
+    #[test]
+    fn test_poll_delay_caps_at_max_multiplier() {
+        assert_eq!(next_poll_delay_secs(300, 3), 2400);
+        assert_eq!(next_poll_delay_secs(300, 10), 2400);
     }
 
     #[test]

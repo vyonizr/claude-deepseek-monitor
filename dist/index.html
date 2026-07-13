@@ -90,9 +90,7 @@
 
       document.addEventListener('mouseup', function() { isDragging = false; });
 
-      // Listen for Rust → frontend state updates
-      T.event.listen('state-update', function(event) {
-        var s = event.payload;
+      function applyState(s) {
         document.getElementById('session-pct').textContent = s.session_pct || '--%';
         document.getElementById('week-pct').textContent = s.week_pct || '--%';
         document.getElementById('session-reset').textContent = s.session_reset || '';
@@ -130,7 +128,13 @@
         } else {
           diagEl.style.display = 'none';
         }
-      });
+      }
+
+      // Fetch initial state immediately (solves race with event listener)
+      T.core.invoke('get_initial_state').then(applyState);
+
+      // Listen for subsequent Rust → frontend state updates
+      T.event.listen('state-update', function(event) { applyState(event.payload); });
     })();
   </script>
 </body>

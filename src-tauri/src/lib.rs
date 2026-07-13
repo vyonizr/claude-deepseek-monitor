@@ -103,6 +103,37 @@ fn emit_state_update(app: &tauri::AppHandle, state: &poll_cycle::DisplayState) {
     let _ = app.emit("state-update", payload);
 }
 
+#[tauri::command]
+fn get_initial_state(app: tauri::AppHandle) -> serde_json::Value {
+    let state = app.state::<Mutex<AppState>>();
+    let state = state.lock().unwrap();
+    let payload = serde_json::json!({
+        "session_pct": state.poll_cycle_state.session_used_pct.map(|v| format!("{:.0}%", v)),
+        "session_reset": state.poll_cycle_state.session_reset_time_text,
+        "session_pacing": state.poll_cycle_state.session_pacing.as_ref().map(|p| match p {
+            poll_cycle::Pacing::Underusing => "under",
+            poll_cycle::Pacing::OnPace => "onpace",
+            poll_cycle::Pacing::Overusing => "over",
+        }),
+        "week_pct": state.poll_cycle_state.week_used_pct.map(|v| format!("{:.0}%", v)),
+        "week_reset": state.poll_cycle_state.week_reset_time_text,
+        "week_pacing": state.poll_cycle_state.week_pacing.as_ref().map(|p| match p {
+            poll_cycle::Pacing::Underusing => "under",
+            poll_cycle::Pacing::OnPace => "onpace",
+            poll_cycle::Pacing::Overusing => "over",
+        }),
+        "deepseek_peak": matches!(state.poll_cycle_state.deepseek_status, poll_cycle::DeepSeekStatus::Peak { .. }),
+        "deepseek_label": match &state.poll_cycle_state.deepseek_status {
+            poll_cycle::DeepSeekStatus::Peak { window_label } => Some(window_label),
+            _ => None,
+        },
+        "next_transition": state.poll_cycle_state.next_transition_info,
+        "stale": state.poll_cycle_state.stale,
+        "diagnostic": state.poll_cycle_state.diagnostic,
+    });
+    payload
+}
+
 fn fire_notifications(
     app: &tauri::AppHandle,
     events: &[poll_cycle::NotificationEvent],
@@ -175,9 +206,17 @@ fn run_claude_command() -> Result<String, String> {
 }
 
 fn run_poll_cycle(app: &tauri::AppHandle) {
+    eprintln!("[monitor] run_poll_cycle starting");
+
     let (raw_text, cmd_diagnostic) = match run_claude_command() {
-        Ok(text) => (Some(text.clone()), None),
-        Err(diag) => (None, Some(diag)),
+        Ok(text) => {
+            eprintln!("[monitor] claude OK, {} bytes received", text.len());
+            (Some(text), None)
+        }
+        Err(diag) => {
+            eprintln!("[monitor] claude FAIL: {diag}");
+            (None, Some(diag))
+        }
     };
 
     let local_now = chrono::Local::now();
@@ -186,6 +225,7 @@ fn run_poll_cycle(app: &tauri::AppHandle) {
 
     let config = settings_to_config(&load_settings(app));
 
+    eprintln!("[monitor] running poll_cycle()");
     let state_container = app.state::<Mutex<AppState>>();
     let mut state_lock = state_container.lock().unwrap();
 
@@ -196,17 +236,19 @@ fn run_poll_cycle(app: &tauri::AppHandle) {
         &state_lock.poll_cycle_state,
     );
 
+    eprintln!("[monitor] poll_cycle done, events={}, stale={}, session_pct={:?}, week_pct={:?}",
+        events.len(), new_state.stale, new_state.session_used_pct, new_state.week_used_pct);
+
     // If the subprocess ran but parsing failed, show the raw output as diagnostic
     if let Some(ref text) = raw_text {
         if new_state.stale && new_state.session_used_pct.is_none() {
             let preview: String = text.chars().take(200).collect();
-            eprintln!("[claude-deepseek-monitor] claude output (first 200 chars):\n---\n{preview}\n---");
-            new_state.diagnostic = Some(format!("Unexpected output format: {preview}"));
+            eprintln!("[monitor] PARSE FAILED. Raw output (200 chars):\n---\n{preview}\n---");
+            new_state.diagnostic = Some(format!("Unexpected output: {preview}"));
         }
     }
 
     if let Some(diag) = cmd_diagnostic {
-        eprintln!("[claude-deepseek-monitor] claude subprocess: {diag}");
         new_state.diagnostic = Some(diag);
     }
 
@@ -215,8 +257,10 @@ fn run_poll_cycle(app: &tauri::AppHandle) {
     drop(state_lock);
     drop(state_container);
 
+    eprintln!("[monitor] firing notifications and emitting state");
     fire_notifications(app, &events);
     emit_state_update(app, &display_state);
+    eprintln!("[monitor] run_poll_cycle done");
 }
 
 #[tauri::command]
@@ -278,7 +322,7 @@ pub fn run() {
         .manage(Mutex::new(AppState {
             poll_cycle_state: poll_cycle::DisplayState::default(),
         }))
-        .invoke_handler(tauri::generate_handler![get_settings, save_settings])
+        .invoke_handler(tauri::generate_handler![get_settings, save_settings, get_initial_state])
         .setup(|app| {
             let icon_image = Image::from_bytes(include_bytes!("../icons/32x32.png"))
                 .expect("failed to decode tray icon");

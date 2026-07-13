@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Settings</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { 
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 12px; padding: 16px; color: #d0d0d0;
+      background: #222; width: 320px; height: 280px;
+    }
+    h2 { font-size: 13px; margin-bottom: 12px; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; }
+    .field { margin-bottom: 10px; }
+    label { display: block; font-size: 10px; color: #888; margin-bottom: 2px; text-transform: uppercase; letter-spacing: 0.3px; }
+    .window-row { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; }
+    .window-row input { width: 50px; background: #333; border: 1px solid #444; color: #d0d0d0; padding: 3px 5px; border-radius: 3px; font-size: 11px; }
+    .window-row span { color: #666; font-size: 11px; }
+    .window-row .label-text { color: #999; font-size: 10px; }
+    .toggle-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+    .toggle-row label { margin-bottom: 0; }
+    .toggle { position: relative; display: inline-block; width: 36px; height: 18px; }
+    .toggle input { opacity: 0; width: 0; height: 0; }
+    .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background: #444; border-radius: 18px; transition: .2s; }
+    .slider:before { content: ''; position: absolute; height: 14px; width: 14px; left: 2px; bottom: 2px; background: #888; border-radius: 50%; transition: .2s; }
+    .toggle input:checked + .slider { background: #4a7; }
+    .toggle input:checked + .slider:before { transform: translateX(18px); background: #fff; }
+    .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+    .actions button { padding: 5px 14px; border: none; border-radius: 4px; cursor: pointer; font-size: 11px; }
+    .btn-primary { background: #4a7; color: #fff; }
+    .btn-secondary { background: #444; color: #aaa; }
+    .btn-primary:hover { background: #5b8; }
+    .btn-secondary:hover { background: #555; }
+  </style>
+</head>
+<body>
+  <h2>Settings</h2>
+
+  <div class="field">
+    <label>DeepSeek Peak Windows (Beijing Time)</label>
+    <div id="windows-container"></div>
+  </div>
+
+  <div class="toggle-row">
+    <label>Auto-launch at login</label>
+    <label class="toggle">
+      <input type="checkbox" id="auto-launch" checked />
+      <span class="slider"></span>
+    </label>
+  </div>
+
+  <div class="actions">
+    <button class="btn-secondary" id="btn-cancel">Cancel</button>
+    <button class="btn-primary" id="btn-save">Save</button>
+  </div>
+
+  <script>
+    let settingsData = null;
+
+    async function loadSettings() {
+      if (window.__TAURI__) {
+        settingsData = await window.__TAURI__.core.invoke('get_settings');
+      } else {
+        settingsData = {
+          deepseek_windows: [
+            { start_hour: 9, end_hour: 12, label: '09:00–12:00 BJT' },
+            { start_hour: 14, end_hour: 18, label: '14:00–18:00 BJT' }
+          ],
+          auto_launch: true
+        };
+      }
+      renderWindows();
+      document.getElementById('auto-launch').checked = settingsData.auto_launch;
+    }
+
+    function renderWindows() {
+      const container = document.getElementById('windows-container');
+      container.innerHTML = '';
+      settingsData.deepseek_windows.forEach((w, i) => {
+        const row = document.createElement('div');
+        row.className = 'window-row';
+        row.innerHTML = `
+          <span class="label-text">Window ${i + 1}:</span>
+          <input type="number" min="0" max="23" value="${w.start_hour}" data-idx="${i}" data-field="start_hour" />
+          <span>to</span>
+          <input type="number" min="0" max="23" value="${w.end_hour}" data-idx="${i}" data-field="end_hour" />
+          <span style="color:#666;font-size:10px">BJT</span>
+        `;
+        container.appendChild(row);
+      });
+      container.querySelectorAll('input').forEach(inp => {
+        inp.addEventListener('change', () => {
+          const idx = parseInt(inp.dataset.idx);
+          const field = inp.dataset.field;
+          settingsData.deepseek_windows[idx][field] = parseInt(inp.value);
+        });
+      });
+    }
+
+    document.getElementById('btn-save').addEventListener('click', async () => {
+      settingsData.auto_launch = document.getElementById('auto-launch').checked;
+      if (window.__TAURI__) {
+        const { getCurrentWindow } = await import('@tauri-apps/api/window');
+        await getCurrentWindow().close();
+      } else {
+        window.close();
+      }
+    });
+
+    document.getElementById('btn-cancel').addEventListener('click', async () => {
+      if (window.__TAURI__) {
+        const { getCurrentWindow } = await import('@tauri-apps/api/window');
+        await getCurrentWindow().close();
+      } else {
+        window.close();
+      }
+    });
+
+    loadSettings();
+  </script>
+</body>
+</html>

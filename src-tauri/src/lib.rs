@@ -199,36 +199,56 @@ fn run_claude_command() -> Result<String, String> {
 fn run_poll_cycle(app: &tauri::AppHandle) {
     eprintln!("[monitor] run_poll_cycle starting");
 
-    let (raw_text, cmd_diagnostic) = match run_claude_command() {
-        Ok(text) => {
-            eprintln!("[monitor] claude OK, {} bytes received", text.len());
-            (Some(text), None)
-        }
-        Err(diag) => {
-            eprintln!("[monitor] claude FAIL: {diag}");
-            (None, Some(diag))
-        }
-    };
-
     let local_now = chrono::Local::now();
     let fixed_offset = *local_now.offset();
     let current_time = local_now.with_timezone(&fixed_offset);
 
     let config = settings_to_config(&load_settings(app));
 
-    eprintln!("[monitor] running poll_cycle()");
     let state_container = app.state::<Mutex<AppState>>();
     let mut state_lock = state_container.lock().unwrap();
 
-    let (mut new_state, events) = poll_cycle::poll_cycle(
-        raw_text.as_deref(),
-        &current_time,
-        &config,
-        &state_lock.poll_cycle_state,
-    );
+    // The claude CLI occasionally returns a malformed/incomplete response on its
+    // first invocation right after the app cold-starts (auth/session warmup),
+    // then succeeds immediately after. Retry once before surfacing a diagnostic,
+    // rather than showing a scary error for a whole poll interval.
+    const MAX_ATTEMPTS: u32 = 2;
+    let mut attempt = 1;
+    let (mut new_state, events, raw_text, cmd_diagnostic) = loop {
+        let (raw_text, cmd_diagnostic) = match run_claude_command() {
+            Ok(text) => {
+                eprintln!("[monitor] claude OK, {} bytes received", text.len());
+                (Some(text), None)
+            }
+            Err(diag) => {
+                eprintln!("[monitor] claude FAIL: {diag}");
+                (None, Some(diag))
+            }
+        };
 
-    eprintln!("[monitor] poll_cycle done, events={}, stale={}, session_pct={:?}, week_pct={:?}",
-        events.len(), new_state.stale, new_state.session_used_pct, new_state.week_used_pct);
+        eprintln!("[monitor] running poll_cycle() (attempt {attempt})");
+        let (new_state, events) = poll_cycle::poll_cycle(
+            raw_text.as_deref(),
+            &current_time,
+            &config,
+            &state_lock.poll_cycle_state,
+        );
+
+        eprintln!("[monitor] poll_cycle done, events={}, stale={}, session_pct={:?}, week_pct={:?}",
+            events.len(), new_state.stale, new_state.session_used_pct, new_state.week_used_pct);
+
+        let parse_failed = raw_text.is_some()
+            && new_state.stale
+            && new_state.session_used_pct.is_none();
+
+        if parse_failed && attempt < MAX_ATTEMPTS {
+            eprintln!("[monitor] parse failed on attempt {attempt}, retrying claude command");
+            attempt += 1;
+            continue;
+        }
+
+        break (new_state, events, raw_text, cmd_diagnostic);
+    };
 
     // If the subprocess ran but parsing failed, show the raw output as diagnostic
     if let Some(ref text) = raw_text {

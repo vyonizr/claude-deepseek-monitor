@@ -56,69 +56,52 @@
   </div>
 
   <script>
-    let settingsData = null;
+    (function() {
+      var T = window.__TAURI__;
+      if (!T) return;
+      var win = T.window.getCurrentWindow();
+      var settingsData = null;
 
-    async function loadSettings() {
-      if (window.__TAURI__) {
-        settingsData = await window.__TAURI__.core.invoke('get_settings');
-      } else {
-        settingsData = {
-          deepseek_windows: [
-            { start_hour: 9, end_hour: 12, label: '09:00–12:00 BJT' },
-            { start_hour: 14, end_hour: 18, label: '14:00–18:00 BJT' }
-          ],
-          auto_launch: true
-        };
-      }
-      renderWindows();
-      document.getElementById('auto-launch').checked = settingsData.auto_launch;
-    }
-
-    function renderWindows() {
-      const container = document.getElementById('windows-container');
-      container.innerHTML = '';
-      settingsData.deepseek_windows.forEach((w, i) => {
-        const row = document.createElement('div');
-        row.className = 'window-row';
-        row.innerHTML = `
-          <span class="label-text">Window ${i + 1}:</span>
-          <input type="number" min="0" max="23" value="${w.start_hour}" data-idx="${i}" data-field="start_hour" />
-          <span>to</span>
-          <input type="number" min="0" max="23" value="${w.end_hour}" data-idx="${i}" data-field="end_hour" />
-          <span style="color:#666;font-size:10px">BJT</span>
-        `;
-        container.appendChild(row);
+      T.core.invoke('get_settings').then(function(data) {
+        settingsData = data;
+        renderWindows();
+        document.getElementById('auto-launch').checked = data.auto_launch;
       });
-      container.querySelectorAll('input').forEach(inp => {
-        inp.addEventListener('change', () => {
-          const idx = parseInt(inp.dataset.idx);
-          const field = inp.dataset.field;
-          settingsData.deepseek_windows[idx][field] = parseInt(inp.value);
+
+      function renderWindows() {
+        var container = document.getElementById('windows-container');
+        container.innerHTML = '';
+        settingsData.deepseek_windows.forEach(function(w, i) {
+          var row = document.createElement('div');
+          row.className = 'window-row';
+          row.innerHTML =
+            '<span class="label-text">Window ' + (i + 1) + ':</span>' +
+            '<input type="number" min="0" max="23" value="' + w.start_hour + '" data-idx="' + i + '" data-field="start_hour" />' +
+            '<span>to</span>' +
+            '<input type="number" min="0" max="23" value="' + w.end_hour + '" data-idx="' + i + '" data-field="end_hour" />' +
+            '<span style="color:#666;font-size:10px">BJT</span>';
+          container.appendChild(row);
+        });
+        container.querySelectorAll('input').forEach(function(inp) {
+          inp.addEventListener('change', function() {
+            var idx = parseInt(inp.dataset.idx);
+            var field = inp.dataset.field;
+            settingsData.deepseek_windows[idx][field] = parseInt(inp.value);
+          });
+        });
+      }
+
+      document.getElementById('btn-save').addEventListener('click', function() {
+        settingsData.auto_launch = document.getElementById('auto-launch').checked;
+        T.core.invoke('save_settings', { settings: settingsData }).then(function() {
+          win.close();
         });
       });
-    }
 
-    document.getElementById('btn-save').addEventListener('click', async () => {
-      settingsData.auto_launch = document.getElementById('auto-launch').checked;
-      if (window.__TAURI__) {
-        await window.__TAURI__.core.invoke('save_settings', { settings: settingsData });
-        const { getCurrentWindow } = await import('@tauri-apps/api/window');
-        await getCurrentWindow().close();
-      } else {
-        window.close();
-      }
-    });
-
-    document.getElementById('btn-cancel').addEventListener('click', async () => {
-      if (window.__TAURI__) {
-        const { getCurrentWindow } = await import('@tauri-apps/api/window');
-        await getCurrentWindow().close();
-      } else {
-        window.close();
-      }
-    });
-
-    loadSettings();
+      document.getElementById('btn-cancel').addEventListener('click', function() {
+        win.close();
+      });
+    })();
   </script>
 </body>
 </html>

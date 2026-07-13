@@ -65,67 +65,65 @@
     </div>
   </div>
   <script>
-    // Drag support
-    let isDragging = false, dragX, dragY;
+    (function() {
+      var T = window.__TAURI__;
+      if (!T) return;
+      var win = T.window.getCurrentWindow();
+      var isDragging = false, startX, startY, origX, origY;
 
-    const titlebar = document.getElementById('titlebar');
-    titlebar.addEventListener('mousedown', (e) => {
-      if (e.button !== 0) return;
-      isDragging = true;
-      dragX = e.screenX; dragY = e.screenY;
-      e.preventDefault();
-    });
-
-    document.addEventListener('mousemove', (e) => {
-      if (!isDragging) return;
-      const dx = e.screenX - dragX;
-      const dy = e.screenY - dragY;
-      window.__TAURI__?.window.getCurrentWindow().then(w => {
-        w.setPosition(w.position.x + dx, w.position.y + dy);
+      // Drag via Tauri IPC — capture outer position once, then offset
+      document.getElementById('titlebar').addEventListener('mousedown', function(e) {
+        if (e.button !== 0) return;
+        isDragging = true;
+        startX = e.screenX; startY = e.screenY;
+        win.outerPosition().then(function(p) { origX = p.x; origY = p.y; });
+        e.preventDefault();
       });
-      dragX = e.screenX; dragY = e.screenY;
-    });
 
-    document.addEventListener('mouseup', () => { isDragging = false; });
+      document.addEventListener('mousemove', function(e) {
+        if (!isDragging) return;
+        win.setPosition(new T.window.PhysicalPosition(
+          origX + e.screenX - startX,
+          origY + e.screenY - startY
+        ));
+      });
 
-    // Listen for state updates from Rust
-    async function connect() {
-      if (!window.__TAURI__) return;
-      const { listen } = await import('@tauri-apps/api/event');
-      await listen('state-update', (event) => {
-        const s = event.payload;
-        document.getElementById('session-pct').textContent = s.session_pct ?? '--%';
-        document.getElementById('week-pct').textContent = s.week_pct ?? '--%';
-        document.getElementById('session-reset').textContent = s.session_reset ?? '';
-        document.getElementById('week-reset').textContent = s.week_reset ?? '';
+      document.addEventListener('mouseup', function() { isDragging = false; });
 
-        const sp = document.getElementById('session-pacer');
+      // Listen for Rust → frontend state updates
+      T.event.listen('state-update', function(event) {
+        var s = event.payload;
+        document.getElementById('session-pct').textContent = s.session_pct || '--%';
+        document.getElementById('week-pct').textContent = s.week_pct || '--%';
+        document.getElementById('session-reset').textContent = s.session_reset || '';
+        document.getElementById('week-reset').textContent = s.week_reset || '';
+
+        var sp = document.getElementById('session-pacer');
         if (s.session_pacing) {
           sp.textContent = s.session_pacing.toUpperCase();
           sp.className = 'pacer ' + s.session_pacing;
         } else { sp.textContent = ''; sp.className = 'pacer'; }
 
-        const wp = document.getElementById('week-pacer');
+        var wp = document.getElementById('week-pacer');
         if (s.week_pacing) {
           wp.textContent = s.week_pacing.toUpperCase();
           wp.className = 'pacer ' + s.week_pacing;
         } else { wp.textContent = ''; wp.className = 'pacer'; }
 
-        const dot = document.getElementById('ds-dot');
+        var dot = document.getElementById('ds-dot');
         if (s.deepseek_peak) {
           dot.className = 'ds-indicator peak';
-          document.getElementById('ds-label').textContent = 'Peak ' + (s.deepseek_label ?? '');
+          document.getElementById('ds-label').textContent = 'Peak ' + (s.deepseek_label || '');
         } else {
           dot.className = 'ds-indicator offpeak';
           document.getElementById('ds-label').textContent = 'Off-peak';
         }
-        document.getElementById('ds-next').textContent = s.next_transition ?? '';
+        document.getElementById('ds-next').textContent = s.next_transition || '';
 
-        const app = document.getElementById('app');
-        if (s.stale) { app.classList.add('stale'); }
-        else { app.classList.remove('stale'); }
+        var a = document.getElementById('app');
+        if (s.stale) { a.classList.add('stale'); } else { a.classList.remove('stale'); }
 
-        const diagEl = document.getElementById('diagnostic');
+        var diagEl = document.getElementById('diagnostic');
         if (s.diagnostic) {
           diagEl.textContent = s.diagnostic;
           diagEl.style.display = 'block';
@@ -133,8 +131,7 @@
           diagEl.style.display = 'none';
         }
       });
-    }
-    connect();
+    })();
   </script>
 </body>
 </html>

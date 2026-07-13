@@ -19,7 +19,7 @@
 | `src-tauri/src/poll_cycle.rs` | Pure poll-cycle function + 24 unit tests. The functional core. |
 | `src-tauri/src/lib.rs` | Imperative shell: Tauri app setup, tray, polling loop, settings persistence, notifications. |
 | `src-tauri/src/main.rs` | Binary entry point — calls `lib::run()`. |
-| `dist/index.html` | Floating widget UI (vanilla HTML/JS, ~240×160px). |
+| `dist/index.html` | Floating widget UI (vanilla HTML/JS, ~240×185px). |
 | `dist/settings.html` | Settings panel (DeepSeek windows + auto-launch toggle). |
 | `.scratch/claude-deepseek-monitor/spec.md` | Full spec from the grilling phase. |
 | `.scratch/claude-deepseek-monitor/issues/` | Ticket breakdown for implementation. |

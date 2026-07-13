@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Tauri v2 desktop app (Rust backend + vanilla HTML/JS frontend): a 240×160px always-on-top overlay showing Claude Code usage pacing and DeepSeek peak-pricing windows. See `README.md` for features/prerequisites and `CONTEXT.md` for domain vocabulary and architectural decisions (ADR-001..006) — read both before making non-trivial changes.
+A Tauri v2 desktop app (Rust backend + vanilla HTML/JS frontend): a 240×185px always-on-top overlay showing Claude Code usage pacing and DeepSeek peak-pricing windows. See `README.md` for features/prerequisites and `CONTEXT.md` for domain vocabulary and architectural decisions (ADR-001..006) — read both before making non-trivial changes.
 
 ## Commands
 

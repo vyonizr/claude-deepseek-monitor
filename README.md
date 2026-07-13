@@ -2,9 +2,9 @@
 
 A compact desktop overlay that shows your Claude Code usage pacing and DeepSeek peak pricing windows at a glance.
 
-**240×160px floating widget** → always-on-top, draggable, system tray icon. Refresh interval is configurable (default 5 minutes).
+**240×185px floating widget** → always-on-top, draggable, system tray icon. Refresh interval is configurable (default 5 minutes).
 
-![widget preview](docs/widget-preview.png) <!-- TODO: add screenshot -->
+![widget preview](docs/widget-preview.png)
 
 ## Features
 

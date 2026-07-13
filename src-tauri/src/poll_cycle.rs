@@ -199,7 +199,7 @@ fn is_in_peak_window(bj_hour: u32, config: &Config) -> Option<&DeepSeekWindow> {
     None
 }
 
-fn deepseek_window_label(window: &DeepSeekWindow) -> String {
+pub fn deepseek_window_label(window: &DeepSeekWindow) -> String {
     format!("{:02}:00–{:02}:00 BJT", window.start_hour, window.end_hour)
 }
 

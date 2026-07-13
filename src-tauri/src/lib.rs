@@ -75,8 +75,8 @@ fn settings_to_config(settings: &SavedSettings) -> poll_cycle::Config {
     }
 }
 
-fn emit_state_update(app: &tauri::AppHandle, state: &poll_cycle::DisplayState) {
-    let payload = serde_json::json!({
+fn to_json(state: &poll_cycle::DisplayState) -> serde_json::Value {
+    serde_json::json!({
         "session_pct": state.session_used_pct.map(|v| format!("{:.0}%", v)),
         "session_reset": state.session_reset_time_text,
         "session_pacing": state.session_pacing.as_ref().map(|p| match p {
@@ -99,39 +99,18 @@ fn emit_state_update(app: &tauri::AppHandle, state: &poll_cycle::DisplayState) {
         "next_transition": state.next_transition_info,
         "stale": state.stale,
         "diagnostic": state.diagnostic,
-    });
-    let _ = app.emit("state-update", payload);
+    })
+}
+
+fn emit_state_update(app: &tauri::AppHandle, state: &poll_cycle::DisplayState) {
+    let _ = app.emit("state-update", to_json(state));
 }
 
 #[tauri::command]
 fn get_initial_state(app: tauri::AppHandle) -> serde_json::Value {
     let state = app.state::<Mutex<AppState>>();
     let state = state.lock().unwrap();
-    let payload = serde_json::json!({
-        "session_pct": state.poll_cycle_state.session_used_pct.map(|v| format!("{:.0}%", v)),
-        "session_reset": state.poll_cycle_state.session_reset_time_text,
-        "session_pacing": state.poll_cycle_state.session_pacing.as_ref().map(|p| match p {
-            poll_cycle::Pacing::Underusing => "under",
-            poll_cycle::Pacing::OnPace => "onpace",
-            poll_cycle::Pacing::Overusing => "over",
-        }),
-        "week_pct": state.poll_cycle_state.week_used_pct.map(|v| format!("{:.0}%", v)),
-        "week_reset": state.poll_cycle_state.week_reset_time_text,
-        "week_pacing": state.poll_cycle_state.week_pacing.as_ref().map(|p| match p {
-            poll_cycle::Pacing::Underusing => "under",
-            poll_cycle::Pacing::OnPace => "onpace",
-            poll_cycle::Pacing::Overusing => "over",
-        }),
-        "deepseek_peak": matches!(state.poll_cycle_state.deepseek_status, poll_cycle::DeepSeekStatus::Peak { .. }),
-        "deepseek_label": match &state.poll_cycle_state.deepseek_status {
-            poll_cycle::DeepSeekStatus::Peak { window_label } => Some(window_label),
-            _ => None,
-        },
-        "next_transition": state.poll_cycle_state.next_transition_info,
-        "stale": state.poll_cycle_state.stale,
-        "diagnostic": state.poll_cycle_state.diagnostic,
-    });
-    payload
+    to_json(&state.poll_cycle_state)
 }
 
 fn fire_notifications(
@@ -271,7 +250,10 @@ fn get_settings(app: tauri::AppHandle) -> serde_json::Value {
             serde_json::json!({
                 "start_hour": w.start_hour,
                 "end_hour": w.end_hour,
-                "label": format!("{:02}:00–{:02}:00 BJT", w.start_hour, w.end_hour),
+                "label": poll_cycle::deepseek_window_label(&poll_cycle::DeepSeekWindow {
+                    start_hour: w.start_hour,
+                    end_hour: w.end_hour,
+                }),
             })
         }).collect::<Vec<_>>(),
         "auto_launch": settings.auto_launch,

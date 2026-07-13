@@ -35,7 +35,7 @@
 |----|----------|-----------|
 | ADR-001 | Tauri v2 (not Electron) for desktop shell | Smaller binary, lower idle memory, native tray and always-on-top support. |
 | ADR-002 | Single pure function as test seam | Avoids mocking subprocess/clock/notifications. Tests supply inputs, assert outputs. |
-| ADR-003 | Fixed 5-minute poll interval | Good enough for usage awareness without excessive CLI spawning. Not user-configurable. |
+| ADR-003 | User-configurable poll interval (default 5 min, min 1) | Lets users trade CLI spawn frequency for freshness; poll thread re-reads the interval from settings each cycle so changes apply without restart. |
 | ADR-004 | ±10pp pacing threshold | Reasonable default for under/on-pace/over classification. Configurable in code. |
 | ADR-005 | Beijing time = UTC+8 hardcoded | No DST, no timezone database dependency needed. |
 | ADR-006 | Local issue tracker (markdown files) | No GitHub/Linear configured for this project. |

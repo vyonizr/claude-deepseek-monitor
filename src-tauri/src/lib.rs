@@ -19,6 +19,12 @@ pub struct AppState {
 struct SavedSettings {
     deepseek_windows: Vec<WindowConfig>,
     auto_launch: bool,
+    #[serde(default = "default_poll_interval_minutes")]
+    poll_interval_minutes: u32,
+}
+
+fn default_poll_interval_minutes() -> u32 {
+    5
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -35,6 +41,7 @@ impl Default for SavedSettings {
                 WindowConfig { start_hour: 14, end_hour: 18 },
             ],
             auto_launch: true,
+            poll_interval_minutes: default_poll_interval_minutes(),
         }
     }
 }
@@ -144,10 +151,15 @@ fn run_claude_command() -> Result<String, String> {
         let candidates = ["claude.cmd", "claude"];
         let mut last_err = "claude not found on PATH".to_string();
         for name in &candidates {
-            match std::process::Command::new(name)
-                .args(["--print", "/usage"])
-                .output()
+            let mut command = std::process::Command::new(name);
+            command.args(["--print", "/usage"]);
+            #[cfg(target_os = "windows")]
             {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x08000000;
+                command.creation_flags(CREATE_NO_WINDOW);
+            }
+            match command.output() {
                 Ok(out) if out.status.success() => {
                     return String::from_utf8(out.stdout)
                         .map(|s| s.trim().to_string())
@@ -257,6 +269,7 @@ fn get_settings(app: tauri::AppHandle) -> serde_json::Value {
             })
         }).collect::<Vec<_>>(),
         "auto_launch": settings.auto_launch,
+        "poll_interval_minutes": settings.poll_interval_minutes,
     })
 }
 
@@ -271,10 +284,15 @@ fn save_settings(app: tauri::AppHandle, settings: serde_json::Value) -> Result<(
             })
         }).collect::<Vec<_>>()
     }).unwrap_or_default();
+    let poll_interval_minutes = settings.get("poll_interval_minutes")
+        .and_then(|v| v.as_u64())
+        .map(|v| (v as u32).max(1))
+        .unwrap_or_else(default_poll_interval_minutes);
 
     let saved = SavedSettings {
         deepseek_windows: windows,
         auto_launch,
+        poll_interval_minutes,
     };
 
     save_settings_to_disk(&app, &saved);
@@ -353,7 +371,7 @@ pub fn run() {
                             WebviewUrl::App("settings.html".into()),
                         )
                         .title("Settings")
-                        .inner_size(320.0, 280.0)
+                        .inner_size(320.0, 320.0)
                         .resizable(false)
                         .build();
                     }
@@ -371,7 +389,8 @@ pub fn run() {
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 loop {
-                    std::thread::sleep(Duration::from_secs(300));
+                    let interval_minutes = load_settings(&handle).poll_interval_minutes.max(1);
+                    std::thread::sleep(Duration::from_secs(interval_minutes as u64 * 60));
                     run_poll_cycle(&handle);
                 }
             });

@@ -2,7 +2,7 @@
 
 A compact desktop overlay that shows your Claude Code usage pacing and DeepSeek peak pricing windows at a glance.
 
-**240×160px floating widget** → always-on-top, draggable, system tray icon. Refreshes every 5 minutes.
+**240×160px floating widget** → always-on-top, draggable, system tray icon. Refresh interval is configurable (default 5 minutes).
 
 ![widget preview](docs/widget-preview.png) <!-- TODO: add screenshot -->
 
@@ -13,7 +13,7 @@ A compact desktop overlay that shows your Claude Code usage pacing and DeepSeek 
 - **DeepSeek peak pricing** — persistently shows peak/off-peak status with time to next transition
 - **OS notifications** — fired exactly when a DeepSeek peak window starts or ends (edge-triggered, not every poll)
 - **Stale state** — if `/usage` parsing fails, last known values shown dimmed
-- **Settings panel** — editable DeepSeek windows (Beijing time), auto-launch toggle
+- **Settings panel** — editable DeepSeek windows (Beijing time), refresh interval, auto-launch toggle
 - **Tray icon** — click to show/hide widget, right-click for Settings and Quit
 
 ## Prerequisites
@@ -63,7 +63,7 @@ The Tauri shell handles all I/O: spawning `claude --print "/usage"`, reading the
 | Decision | Choice |
 |----------|--------|
 | Framework | [Tauri v2](https://v2.tauri.app) (Rust backend, web frontend) |
-| Poll interval | 5 minutes (fixed) |
+| Poll interval | User-configurable (default 5 minutes, min 1) |
 | Pacing threshold | ±10 percentage points around even pace |
 | DeepSeek windows | 09:00–12:00 and 14:00–18:00 Beijing time (UTC+8, no DST) |
 | Settings storage | `settings.json` in OS app data directory |

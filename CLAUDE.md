@@ -35,7 +35,7 @@ poll_cycle(raw_usage_text, current_time, config, previous_state) -> (new_display
 
 When changing behavior (pacing thresholds, DeepSeek windows, staleness rules, notification triggering), prefer editing `poll_cycle.rs` and covering it with a unit test there, rather than adding logic to `lib.rs`. `lib.rs` should stay limited to I/O plumbing that calls into `poll_cycle()`.
 
-Poll interval is fixed at 5 minutes (not user-configurable); DeepSeek windows and auto-launch are user-configurable via the settings panel, persisted to `settings.json`.
+Poll interval, DeepSeek windows, and auto-launch are all user-configurable via the settings panel, persisted to `settings.json`. The poll thread re-reads the interval from settings before each sleep, so a changed interval takes effect on the next cycle without an app restart.
 
 ## Testing notes
 

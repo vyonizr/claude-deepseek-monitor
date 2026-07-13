@@ -9,7 +9,7 @@
     body { 
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
       font-size: 12px; padding: 16px; color: #d0d0d0;
-      background: #222; width: 320px; height: 280px;
+      background: #222; width: 320px; height: 320px;
     }
     h2 { font-size: 13px; margin-bottom: 12px; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; }
     .field { margin-bottom: 10px; }
@@ -42,6 +42,11 @@
     <div id="windows-container"></div>
   </div>
 
+  <div class="field">
+    <label>Refresh Interval (minutes)</label>
+    <input type="number" min="1" id="poll-interval" style="width:60px; background:#333; border:1px solid #444; color:#d0d0d0; padding:3px 5px; border-radius:3px; font-size:11px;" />
+  </div>
+
   <div class="toggle-row">
     <label>Auto-launch at login</label>
     <label class="toggle">
@@ -66,6 +71,7 @@
         settingsData = data;
         renderWindows();
         document.getElementById('auto-launch').checked = data.auto_launch;
+        document.getElementById('poll-interval').value = data.poll_interval_minutes;
       });
 
       function renderWindows() {
@@ -93,6 +99,7 @@
 
       document.getElementById('btn-save').addEventListener('click', function() {
         settingsData.auto_launch = document.getElementById('auto-launch').checked;
+        settingsData.poll_interval_minutes = Math.max(1, parseInt(document.getElementById('poll-interval').value) || 1);
         T.core.invoke('save_settings', { settings: settingsData }).then(function() {
           win.close();
         });

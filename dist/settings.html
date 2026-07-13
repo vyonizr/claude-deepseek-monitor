@@ -101,6 +101,7 @@
     document.getElementById('btn-save').addEventListener('click', async () => {
       settingsData.auto_launch = document.getElementById('auto-launch').checked;
       if (window.__TAURI__) {
+        await window.__TAURI__.core.invoke('save_settings', { settings: settingsData });
         const { getCurrentWindow } = await import('@tauri-apps/api/window');
         await getCurrentWindow().close();
       } else {

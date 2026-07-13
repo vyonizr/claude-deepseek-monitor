@@ -1,4 +1,4 @@
-use chrono::{DateTime, Duration, FixedOffset, NaiveDateTime, Timelike};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDateTime, Timelike};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pacing {
@@ -117,11 +117,11 @@ fn extract_reset_time(line: &str) -> Option<String> {
     if trimmed.is_empty() { None } else { Some(trimmed) }
 }
 
-fn parse_reset_datetime(reset_text: &str, local_offset: FixedOffset) -> Option<DateTime<FixedOffset>> {
+fn parse_reset_datetime(reset_text: &str, local_offset: FixedOffset, current_year: i32) -> Option<DateTime<FixedOffset>> {
     let without_tz = reset_text.split(" (").next()?;
     let clean = without_tz.trim();
     let naive = NaiveDateTime::parse_from_str(
-        &format!("{} 2000", clean),
+        &format!("{} {}", clean, current_year),
         "%b %d, %I:%M%P %Y",
     ).ok()?;
     Some(naive.and_local_timezone(local_offset).single()?)
@@ -242,8 +242,9 @@ pub fn poll_cycle(
 
     let (mut display, usage_ok) = if let Some((sp, sr, wp, wr)) = parsed {
         let local_offset = *current_time.offset();
-        let session_reset_dt = parse_reset_datetime(&sr, local_offset);
-        let week_reset_dt = parse_reset_datetime(&wr, local_offset);
+        let current_year = current_time.year();
+        let session_reset_dt = parse_reset_datetime(&sr, local_offset, current_year);
+        let week_reset_dt = parse_reset_datetime(&wr, local_offset, current_year);
 
         let session_start_str = if previous_state.session_reset_time_text.as_deref() != Some(&sr) {
             Some(current_time.to_rfc3339())
@@ -572,7 +573,7 @@ mod tests {
     fn test_weekly_pacing_calculation() {
         let week_reset = "Jul 18, 4:00am (Asia/Jakarta)";
         let local_offset = FixedOffset::east_opt(7 * 3600).unwrap();
-        let reset_dt = parse_reset_datetime(week_reset, local_offset).unwrap();
+        let reset_dt = parse_reset_datetime(week_reset, local_offset, 2026).unwrap();
 
         let window_start = reset_dt - Duration::days(7);
 
@@ -587,7 +588,7 @@ mod tests {
     #[test]
     fn test_parse_reset_datetime_format() {
         let local_offset = FixedOffset::east_opt(7 * 3600).unwrap();
-        let result = parse_reset_datetime("Jul 13, 8:40pm (Asia/Jakarta)", local_offset);
+        let result = parse_reset_datetime("Jul 13, 8:40pm (Asia/Jakarta)", local_offset, 2026);
         assert!(result.is_some());
         let dt = result.unwrap();
         assert_eq!(dt.month(), 7);
@@ -599,7 +600,7 @@ mod tests {
     #[test]
     fn test_parse_reset_datetime_without_timezone() {
         let local_offset = FixedOffset::east_opt(7 * 3600).unwrap();
-        let result = parse_reset_datetime("Jul 18, 4:00am (UTC)", local_offset);
+        let result = parse_reset_datetime("Jul 18, 4:00am (UTC)", local_offset, 2026);
         assert!(result.is_some());
         let dt = result.unwrap();
         assert_eq!(dt.month(), 7);

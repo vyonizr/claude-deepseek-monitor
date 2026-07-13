@@ -9,14 +9,69 @@ use tauri::{
     Emitter, Manager, WebviewUrl, WebviewWindowBuilder,
 };
 use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_autostart::ManagerExt;
 
 pub struct AppState {
     pub poll_cycle_state: poll_cycle::DisplayState,
 }
 
-impl AppState {
-    fn config(&self) -> poll_cycle::Config {
-        poll_cycle::Config::default()
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SavedSettings {
+    deepseek_windows: Vec<WindowConfig>,
+    auto_launch: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WindowConfig {
+    start_hour: u8,
+    end_hour: u8,
+}
+
+impl Default for SavedSettings {
+    fn default() -> Self {
+        Self {
+            deepseek_windows: vec![
+                WindowConfig { start_hour: 9, end_hour: 12 },
+                WindowConfig { start_hour: 14, end_hour: 18 },
+            ],
+            auto_launch: true,
+        }
+    }
+}
+
+fn settings_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("settings.json"))
+}
+
+fn load_settings(app: &tauri::AppHandle) -> SavedSettings {
+    let path = match settings_path(app) {
+        Ok(p) => p,
+        Err(_) => return SavedSettings::default(),
+    };
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_settings_to_disk(app: &tauri::AppHandle, settings: &SavedSettings) {
+    if let Ok(path) = settings_path(app) {
+        if let Ok(json) = serde_json::to_string_pretty(settings) {
+            let _ = std::fs::write(&path, &json);
+        }
+    }
+}
+
+fn settings_to_config(settings: &SavedSettings) -> poll_cycle::Config {
+    poll_cycle::Config {
+        deepseek_windows: settings.deepseek_windows.iter().map(|w| {
+            poll_cycle::DeepSeekWindow {
+                start_hour: w.start_hour,
+                end_hour: w.end_hour,
+            }
+        }).collect(),
     }
 }
 
@@ -83,13 +138,15 @@ fn run_poll_cycle(app: &tauri::AppHandle) {
     let fixed_offset = *local_now.offset();
     let current_time = local_now.with_timezone(&fixed_offset);
 
+    let config = settings_to_config(&load_settings(app));
+
     let state_container = app.state::<Mutex<AppState>>();
     let mut state_lock = state_container.lock().unwrap();
 
     let (new_state, events) = poll_cycle::poll_cycle(
         raw_text.as_deref(),
         &current_time,
-        &state_lock.config(),
+        &config,
         &state_lock.poll_cycle_state,
     );
 
@@ -103,14 +160,50 @@ fn run_poll_cycle(app: &tauri::AppHandle) {
 }
 
 #[tauri::command]
-fn get_settings() -> serde_json::Value {
+fn get_settings(app: tauri::AppHandle) -> serde_json::Value {
+    let settings = load_settings(&app);
     serde_json::json!({
-        "deepseek_windows": [
-            { "start_hour": 9, "end_hour": 12, "label": "09:00–12:00 BJT" },
-            { "start_hour": 14, "end_hour": 18, "label": "14:00–18:00 BJT" }
-        ],
-        "auto_launch": true
+        "deepseek_windows": settings.deepseek_windows.iter().map(|w| {
+            serde_json::json!({
+                "start_hour": w.start_hour,
+                "end_hour": w.end_hour,
+                "label": format!("{:02}:00–{:02}:00 BJT", w.start_hour, w.end_hour),
+            })
+        }).collect::<Vec<_>>(),
+        "auto_launch": settings.auto_launch,
     })
+}
+
+#[tauri::command]
+fn save_settings(app: tauri::AppHandle, settings: serde_json::Value) -> Result<(), String> {
+    let auto_launch = settings.get("auto_launch").and_then(|v| v.as_bool()).unwrap_or(true);
+    let windows = settings.get("deepseek_windows").and_then(|v| v.as_array()).map(|arr| {
+        arr.iter().filter_map(|w| {
+            Some(WindowConfig {
+                start_hour: w.get("start_hour")?.as_u64()? as u8,
+                end_hour: w.get("end_hour")?.as_u64()? as u8,
+            })
+        }).collect::<Vec<_>>()
+    }).unwrap_or_default();
+
+    let saved = SavedSettings {
+        deepseek_windows: windows,
+        auto_launch,
+    };
+
+    save_settings_to_disk(&app, &saved);
+
+    {
+        let autostart = app.autolaunch();
+        let current = autostart.is_enabled().unwrap_or(false);
+        if auto_launch && !current {
+            let _ = autostart.enable();
+        } else if !auto_launch && current {
+            let _ = autostart.disable();
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -125,7 +218,7 @@ pub fn run() {
         .manage(Mutex::new(AppState {
             poll_cycle_state: poll_cycle::DisplayState::default(),
         }))
-        .invoke_handler(tauri::generate_handler![get_settings])
+        .invoke_handler(tauri::generate_handler![get_settings, save_settings])
         .setup(|app| {
             let icon_image = Image::from_bytes(include_bytes!("../icons/32x32.png"))
                 .expect("failed to decode tray icon");
@@ -135,6 +228,14 @@ pub fn run() {
             let quit_item =
                 tauri::menu::MenuItemBuilder::with_id("quit", "Quit").build(app)?;
             let menu = Menu::with_items(app, &[&settings_item, &quit_item])?;
+
+            // Apply autostart from saved settings
+            let handle = app.handle();
+            let saved = load_settings(handle);
+            if saved.auto_launch {
+                let autostart = handle.autolaunch();
+                let _ = autostart.enable();
+            }
 
             TrayIconBuilder::new()
                 .icon(icon_image)

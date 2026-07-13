@@ -13,22 +13,21 @@
       background: transparent;
     }
     #app {
-      width: 240px; height: 160px;
+      width: 240px; height: 185px;
       background: rgba(30, 30, 35, 0.92);
       border: 1px solid rgba(255,255,255,0.08);
       border-radius: 8px;
-      padding: 10px 12px;
+      padding: 8px 12px;
       color: #d0d0d0;
-      display: flex; flex-direction: column; gap: 6px;
+      display: flex; flex-direction: column; gap: 4px;
       user-select: none;
     }
-    #titlebar {
-      display: flex; justify-content: space-between; align-items: center;
-      cursor: grab; padding: 2px 0 4px 0; border-bottom: 1px solid rgba(255,255,255,0.06);
+    .group-header {
+      font-size: 9px; color: #666; text-transform: uppercase; letter-spacing: 1px;
+      padding: 3px 0 1px 0; border-bottom: 1px solid rgba(255,255,255,0.05);
     }
-    #titlebar:active { cursor: grabbing; }
-    #titlebar span { font-size: 10px; color: #888; font-weight: 500; letter-spacing: 0.3px; }
-    .section { display: flex; flex-direction: column; gap: 2px; }
+    .group-header:first-of-type { padding-top: 0; }
+    .section { display: flex; flex-direction: column; gap: 1px; }
     .label { font-size: 9px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; }
     .row { display: flex; justify-content: space-between; align-items: center; }
     .value { color: #e0e0e0; font-weight: 500; }
@@ -36,7 +35,7 @@
     .pacer.under { background: rgba(50, 200, 100, 0.15); color: #6f6; }
     .pacer.onpace { background: rgba(200, 180, 50, 0.15); color: #dd5; }
     .pacer.over { background: rgba(220, 60, 60, 0.15); color: #e55; }
-    .ds-status { display: flex; align-items: center; gap: 5px; margin-top: 2px; }
+    .ds-status { display: flex; align-items: center; gap: 5px; padding-top: 2px; }
     .ds-indicator { width: 8px; height: 8px; border-radius: 50%; }
     .ds-indicator.peak { background: #e55; }
     .ds-indicator.offpeak { background: #6f6; }
@@ -46,7 +45,7 @@
 </head>
 <body>
   <div id="app">
-    <div id="titlebar"><span>CLAUDE / DEEPSEEK</span></div>
+    <div class="group-header" style="cursor:grab" id="titlebar">CLAUDE</div>
     <div class="section">
       <div class="label">Session</div>
       <div class="row"><span class="value" id="session-pct">--%</span><span class="pacer" id="session-pacer"></span></div>
@@ -57,12 +56,13 @@
       <div class="row"><span class="value" id="week-pct">--%</span><span class="pacer" id="week-pacer"></span></div>
       <div class="row" style="font-size:9px;color:#666"><span id="week-reset">--</span></div>
     </div>
-    <div id="diagnostic" class="diagnostic"></div>
+    <div class="group-header">DEEPSEEK</div>
     <div class="ds-status">
       <span class="ds-indicator offpeak" id="ds-dot"></span>
       <span id="ds-label" style="font-size:10px">Off-peak</span>
       <span style="font-size:9px;color:#666;margin-left:auto" id="ds-next">--</span>
     </div>
+    <div id="diagnostic" class="diagnostic"></div>
   </div>
   <script>
     (function() {

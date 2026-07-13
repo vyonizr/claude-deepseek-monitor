@@ -12,7 +12,7 @@
       {
         "title": "Monitor",
         "width": 240,
-        "height": 160,
+        "height": 185,
         "resizable": false,
         "decorations": false,
         "alwaysOnTop": true,

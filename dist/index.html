@@ -89,13 +89,15 @@
         var labels = { under: 'UNDER PACE', onpace: 'ON PACE', over: 'OVER PACE' };
         var sp = document.getElementById('session-pacer');
         if (s.session_pacing) {
-          sp.textContent = labels[s.session_pacing] || s.session_pacing.toUpperCase();
+          var label = labels[s.session_pacing] || s.session_pacing.toUpperCase();
+          sp.textContent = s.session_pacing_pct != null ? s.session_pacing_pct + '% ' + label : label;
           sp.className = 'pacer ' + s.session_pacing;
         } else { sp.textContent = ''; sp.className = 'pacer'; }
 
         var wp = document.getElementById('week-pacer');
         if (s.week_pacing) {
-          wp.textContent = labels[s.week_pacing] || s.week_pacing.toUpperCase();
+          var label = labels[s.week_pacing] || s.week_pacing.toUpperCase();
+          wp.textContent = s.week_pacing_pct != null ? s.week_pacing_pct + '% ' + label : label;
           wp.className = 'pacer ' + s.week_pacing;
         } else { wp.textContent = ''; wp.className = 'pacer'; }
 

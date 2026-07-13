@@ -6,7 +6,7 @@
 |------|------------|
 | Session window | Claude Code's per-session usage quota. Resets after the session lifetime (~hours). Shown in `/usage` as "Current session: X% used". |
 | Weekly quota | Claude Code's rolling 7-day usage allowance. Resets on a fixed weekly schedule. Shown in `/usage` as "Current week (all models): X% used". |
-| Pacing | Comparison of % of quota used vs % of time elapsed in the window. Classified as **Underusing** (ahead of pace, diff < -15pp, shown as "UNDER PACE"), **OnPace** (within ±15pp, shown as "ON PACE"), **Overusing** (behind pace, diff > +15pp, shown as "OVER PACE"). Rust enum variants serialize to `"under"` / `"onpace"` / `"over"`; `dist/index.html` maps those to the display labels. |
+| Pacing | Comparison of % of quota used vs % of time elapsed in the window. Classified as **Underusing** (ahead of pace, diff < -10pp, shown as `"N% UNDER PACE"`), **OnPace** (within ±10pp, shown as `"ON PACE"`), **Overusing** (behind pace, diff > +10pp, shown as `"N% OVER PACE"`). The percentage prefix is `\|diff\|` rounded, emitted as `session_pacing_pct`/`week_pacing_pct` in the JSON payload. Rust enum variants serialize to `"under"` / `"onpace"` / `"over"`; `dist/index.html` maps those to the display labels. |
 | Stale | State of the display when the last poll failed to parse `/usage` output. Previous values shown dimmed. |
 | DeepSeek peak window | One of two daily Beijing-time windows (09:00–12:00 and 14:00–18:00 BJT / 01:00–04:00 and 06:00–10:00 UTC) during which DeepSeek charges 2× standard rate. |
 | Poll cycle | A pure function `(raw_usage_text, current_time, config, previous_state) -> (new_state, notification_events)` — the single unit-testable seam. All app logic lives here. |
@@ -25,11 +25,13 @@
 
 ## How pacing is calculated
 
-`compute_pacing(used_pct, elapsed_pct)` (`poll_cycle.rs:172`) compares two percentages and buckets the `diff = used_pct - elapsed_pct` against `PACING_THRESHOLD` (`poll_cycle.rs:86`, currently `15.0`):
+`compute_pacing(used_pct, elapsed_pct)` (`poll_cycle.rs:172`) compares two percentages and buckets the `diff = used_pct - elapsed_pct` against `PACING_THRESHOLD` (`poll_cycle.rs:86`, currently `10.0`):
 
-- `diff < -15` → **Underusing** (using quota slower than time is passing)
-- `diff > +15` → **Overusing**
-- otherwise → **OnPace** (boundary values of exactly ±15 are `OnPace`, since the comparison is strict `<`/`>`)
+- `diff < -10` → **Underusing** (using quota slower than time is passing)
+- `diff > +10` → **Overusing**
+- otherwise → **OnPace** (boundary values of exactly ±10 are `OnPace`, since the comparison is strict `<`/`>`)
+
+When the label is not `OnPace`, the rounded absolute diff is prepended: `"{pct}% UNDER PACE"` or `"{pct}% OVER PACE"`.
 
 `used_pct` comes straight from the parsed `/usage` text. `elapsed_pct` is derived differently per window:
 
@@ -49,7 +51,7 @@ If the window hasn't actually started yet (`start >= reset`) or its duration is 
 | ADR-001 | Tauri v2 (not Electron) for desktop shell | Smaller binary, lower idle memory, native tray and always-on-top support. |
 | ADR-002 | Single pure function as test seam | Avoids mocking subprocess/clock/notifications. Tests supply inputs, assert outputs. |
 | ADR-003 | User-configurable poll interval (default 5 min, min 1) | Lets users trade CLI spawn frequency for freshness; poll thread re-reads the interval from settings each cycle so changes apply without restart. |
-| ADR-004 | ±15pp pacing threshold | Reasonable default for under/on-pace/over classification. Configurable in code. |
+| ADR-004 | ±10pp pacing threshold, percentage prefix on OVER/UNDER labels | ±15pp felt abrupt (first badge jumped from nothing to 15%). At ±10pp the badge starts at "10% OVER/UNDER PACE" — a natural minimal alert. The percentage value (`\|diff\|`) conveys severity, so the threshold only marks "worth your attention." |
 | ADR-005 | Beijing time = UTC+8 hardcoded | No DST, no timezone database dependency needed. |
 | ADR-006 | Local issue tracker (markdown files) | No GitHub/Linear configured for this project. |
 

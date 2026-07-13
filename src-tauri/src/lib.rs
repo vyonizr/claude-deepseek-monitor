@@ -175,8 +175,8 @@ fn run_claude_command() -> Result<String, String> {
 }
 
 fn run_poll_cycle(app: &tauri::AppHandle) {
-    let (raw_text, diagnostic) = match run_claude_command() {
-        Ok(text) => (Some(text), None),
+    let (raw_text, cmd_diagnostic) = match run_claude_command() {
+        Ok(text) => (Some(text.clone()), None),
         Err(diag) => (None, Some(diag)),
     };
 
@@ -196,7 +196,17 @@ fn run_poll_cycle(app: &tauri::AppHandle) {
         &state_lock.poll_cycle_state,
     );
 
-    if let Some(diag) = diagnostic {
+    // If the subprocess ran but parsing failed, show the raw output as diagnostic
+    if let Some(ref text) = raw_text {
+        if new_state.stale && new_state.session_used_pct.is_none() {
+            let preview: String = text.chars().take(200).collect();
+            eprintln!("[claude-deepseek-monitor] claude output (first 200 chars):\n---\n{preview}\n---");
+            new_state.diagnostic = Some(format!("Unexpected output format: {preview}"));
+        }
+    }
+
+    if let Some(diag) = cmd_diagnostic {
+        eprintln!("[claude-deepseek-monitor] claude subprocess: {diag}");
         new_state.diagnostic = Some(diag);
     }
 

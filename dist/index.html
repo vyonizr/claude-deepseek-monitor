@@ -32,8 +32,8 @@
     .row { display: flex; justify-content: space-between; align-items: center; }
     .value { color: #e0e0e0; font-weight: 500; }
     .pacer { font-size: 9px; padding: 1px 5px; border-radius: 3px; }
-    .pacer.under { background: rgba(50, 200, 100, 0.15); color: #6f6; }
-    .pacer.onpace { background: rgba(200, 180, 50, 0.15); color: #dd5; }
+    .pacer.under { background: rgba(60, 120, 220, 0.2); color: #68f; }
+    .pacer.onpace { background: rgba(50, 200, 100, 0.15); color: #6f6; }
     .pacer.over { background: rgba(220, 60, 60, 0.15); color: #e55; }
     .ds-status { display: flex; align-items: center; gap: 5px; padding-top: 2px; }
     .ds-indicator { width: 8px; height: 8px; border-radius: 50%; }
@@ -86,6 +86,7 @@
         document.getElementById('session-reset').textContent = s.session_reset || '';
         document.getElementById('week-reset').textContent = s.week_reset || '';
 
+        var labels = { under: 'UNDER PACE', onpace: 'ON PACE', over: 'OVER PACE' };
         var sp = document.getElementById('session-pacer');
         if (s.session_pacing) {
           sp.textContent = s.session_pacing.toUpperCase();
@@ -94,7 +95,7 @@
 
         var wp = document.getElementById('week-pacer');
         if (s.week_pacing) {
-          wp.textContent = s.week_pacing.toUpperCase();
+          wp.textContent = labels[s.week_pacing] || s.week_pacing.toUpperCase();
           wp.className = 'pacer ' + s.week_pacing;
         } else { wp.textContent = ''; wp.className = 'pacer'; }
 

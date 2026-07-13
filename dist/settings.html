@@ -74,26 +74,46 @@
         document.getElementById('poll-interval').value = data.poll_interval_minutes;
       });
 
+      function makeHourInput(idx, field, value) {
+        var inp = document.createElement('input');
+        inp.type = 'number';
+        inp.min = '0';
+        inp.max = '23';
+        inp.value = value;
+        inp.dataset.idx = idx;
+        inp.dataset.field = field;
+        inp.addEventListener('change', function() {
+          settingsData.deepseek_windows[idx][field] = parseInt(inp.value);
+        });
+        return inp;
+      }
+
       function renderWindows() {
         var container = document.getElementById('windows-container');
         container.innerHTML = '';
         settingsData.deepseek_windows.forEach(function(w, i) {
           var row = document.createElement('div');
           row.className = 'window-row';
-          row.innerHTML =
-            '<span class="label-text">Window ' + (i + 1) + ':</span>' +
-            '<input type="number" min="0" max="23" value="' + w.start_hour + '" data-idx="' + i + '" data-field="start_hour" />' +
-            '<span>to</span>' +
-            '<input type="number" min="0" max="23" value="' + w.end_hour + '" data-idx="' + i + '" data-field="end_hour" />' +
-            '<span style="color:#666;font-size:10px">BJT</span>';
+
+          var labelSpan = document.createElement('span');
+          labelSpan.className = 'label-text';
+          labelSpan.textContent = 'Window ' + (i + 1) + ':';
+
+          var toSpan = document.createElement('span');
+          toSpan.textContent = 'to';
+
+          var bjtSpan = document.createElement('span');
+          bjtSpan.style.color = '#666';
+          bjtSpan.style.fontSize = '10px';
+          bjtSpan.textContent = 'BJT';
+
+          row.appendChild(labelSpan);
+          row.appendChild(makeHourInput(i, 'start_hour', w.start_hour));
+          row.appendChild(toSpan);
+          row.appendChild(makeHourInput(i, 'end_hour', w.end_hour));
+          row.appendChild(bjtSpan);
+
           container.appendChild(row);
-        });
-        container.querySelectorAll('input').forEach(function(inp) {
-          inp.addEventListener('change', function() {
-            var idx = parseInt(inp.dataset.idx);
-            var field = inp.dataset.field;
-            settingsData.deepseek_windows[idx][field] = parseInt(inp.value);
-          });
         });
       }
 

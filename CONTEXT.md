@@ -21,8 +21,6 @@
 | `src-tauri/src/main.rs` | Binary entry point — calls `lib::run()`. |
 | `dist/index.html` | Floating widget UI (vanilla HTML/JS, ~240×185px). |
 | `dist/settings.html` | Settings panel (DeepSeek windows + auto-launch toggle). |
-| `.scratch/claude-deepseek-monitor/spec.md` | Full spec from the grilling phase. |
-| `.scratch/claude-deepseek-monitor/issues/` | Ticket breakdown for implementation. |
 | `src-tauri/capabilities/default.json` | Tauri v2 permission capabilities. |
 
 ## How pacing is calculated

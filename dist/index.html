@@ -41,6 +41,7 @@
     .ds-indicator.peak { background: #e55; }
     .ds-indicator.offpeak { background: #6f6; }
     .stale { opacity: 0.4; }
+    .diagnostic { position: absolute; bottom: 2px; left: 8px; right: 8px; font-size: 8px; color: #e55; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: none; }
   </style>
 </head>
 <body>
@@ -56,6 +57,7 @@
       <div class="row"><span class="value" id="week-pct">--%</span><span class="pacer" id="week-pacer"></span></div>
       <div class="row" style="font-size:9px;color:#666"><span id="week-reset">--</span></div>
     </div>
+    <div id="diagnostic" class="diagnostic"></div>
     <div class="ds-status">
       <span class="ds-indicator offpeak" id="ds-dot"></span>
       <span id="ds-label" style="font-size:10px">Off-peak</span>
@@ -122,6 +124,14 @@
         const app = document.getElementById('app');
         if (s.stale) { app.classList.add('stale'); }
         else { app.classList.remove('stale'); }
+
+        const diagEl = document.getElementById('diagnostic');
+        if (s.diagnostic) {
+          diagEl.textContent = s.diagnostic;
+          diagEl.style.display = 'block';
+        } else {
+          diagEl.style.display = 'none';
+        }
       });
     }
     connect();

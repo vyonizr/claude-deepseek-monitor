@@ -98,6 +98,7 @@ fn emit_state_update(app: &tauri::AppHandle, state: &poll_cycle::DisplayState) {
         },
         "next_transition": state.next_transition_info,
         "stale": state.stale,
+        "diagnostic": state.diagnostic,
     });
     let _ = app.emit("state-update", payload);
 }
@@ -126,13 +127,58 @@ fn fire_notifications(
     }
 }
 
+fn run_claude_command() -> Result<String, String> {
+    let cmd = if cfg!(target_os = "windows") {
+        // On Windows npm installs CLI wrappers as .cmd files;
+        // try claude.cmd first, fall back to bare claude.
+        let candidates = ["claude.cmd", "claude"];
+        let mut last_err = "claude not found on PATH".to_string();
+        for name in &candidates {
+            match std::process::Command::new(name)
+                .args(["--print", "/usage"])
+                .output()
+            {
+                Ok(out) if out.status.success() => {
+                    return String::from_utf8(out.stdout)
+                        .map(|s| s.trim().to_string())
+                        .map_err(|e| format!("claude output is not UTF-8: {e}"));
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    last_err = format!("{name} exited with code {:?}: {stderr}", out.status.code());
+                }
+                Err(e) => {
+                    last_err = format!("{name}: {e}");
+                }
+            }
+        }
+        Err(last_err)
+    } else {
+        match std::process::Command::new("claude")
+            .args(["--print", "/usage"])
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                String::from_utf8(out.stdout)
+                    .map(|s| s.trim().to_string())
+                    .map_err(|e| format!("claude output is not UTF-8: {e}"))
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                Err(format!("claude exited with code {:?}: {stderr}", out.status.code()))
+            }
+            Err(e) => Err(format!("claude: {e}")),
+        }
+    };
+
+    cmd
+}
+
 fn run_poll_cycle(app: &tauri::AppHandle) {
-    let raw_text = std::process::Command::new("claude")
-        .args(["--print", "/usage"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+    let (raw_text, diagnostic) = match run_claude_command() {
+        Ok(text) => (Some(text), None),
+        Err(diag) => (None, Some(diag)),
+    };
 
     let local_now = chrono::Local::now();
     let fixed_offset = *local_now.offset();
@@ -143,12 +189,16 @@ fn run_poll_cycle(app: &tauri::AppHandle) {
     let state_container = app.state::<Mutex<AppState>>();
     let mut state_lock = state_container.lock().unwrap();
 
-    let (new_state, events) = poll_cycle::poll_cycle(
+    let (mut new_state, events) = poll_cycle::poll_cycle(
         raw_text.as_deref(),
         &current_time,
         &config,
         &state_lock.poll_cycle_state,
     );
+
+    if let Some(diag) = diagnostic {
+        new_state.diagnostic = Some(diag);
+    }
 
     let display_state = new_state.clone();
     state_lock.poll_cycle_state = new_state;

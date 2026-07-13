@@ -53,6 +53,7 @@ pub struct DisplayState {
     pub deepseek_status: DeepSeekStatus,
     pub next_transition_info: Option<String>,
     pub stale: bool,
+    pub diagnostic: Option<String>,
 }
 
 impl Default for DisplayState {
@@ -68,6 +69,16 @@ impl Default for DisplayState {
             deepseek_status: DeepSeekStatus::OffPeak,
             next_transition_info: None,
             stale: false,
+            diagnostic: None,
+        }
+    }
+}
+
+impl DisplayState {
+    pub fn new_diagnostic(msg: impl Into<String>) -> Self {
+        Self {
+            diagnostic: Some(msg.into()),
+            ..Default::default()
         }
     }
 }
@@ -300,6 +311,7 @@ pub fn poll_cycle(
     } else {
         let mut display = previous_state.clone();
         display.stale = raw_usage_text.is_some();
+        // carry diagnostic forward instead of clearing it
         (display, false)
     };
 

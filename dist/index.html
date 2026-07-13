@@ -89,7 +89,7 @@
         var labels = { under: 'UNDER PACE', onpace: 'ON PACE', over: 'OVER PACE' };
         var sp = document.getElementById('session-pacer');
         if (s.session_pacing) {
-          sp.textContent = s.session_pacing.toUpperCase();
+          sp.textContent = labels[s.session_pacing] || s.session_pacing.toUpperCase();
           sp.className = 'pacer ' + s.session_pacing;
         } else { sp.textContent = ''; sp.className = 'pacer'; }
 

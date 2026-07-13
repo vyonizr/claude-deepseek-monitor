@@ -83,7 +83,7 @@ impl DisplayState {
     }
 }
 
-const PACING_THRESHOLD: f64 = 10.0;
+const PACING_THRESHOLD: f64 = 15.0;
 
 fn parse_claude_usage_text(text: &str) -> Option<(f64, String, f64, String)> {
     let mut session_pct: Option<f64> = None;
@@ -504,10 +504,10 @@ mod tests {
 
     #[test]
     fn test_pacing_boundaries() {
-        assert_eq!(compute_pacing(40.0, 50.0), Pacing::OnPace);
-        assert_eq!(compute_pacing(60.0, 50.0), Pacing::OnPace);
-        assert_eq!(compute_pacing(39.0, 50.0), Pacing::Underusing);
-        assert_eq!(compute_pacing(61.0, 50.0), Pacing::Overusing);
+        assert_eq!(compute_pacing(35.0, 50.0), Pacing::OnPace);
+        assert_eq!(compute_pacing(65.0, 50.0), Pacing::OnPace);
+        assert_eq!(compute_pacing(34.0, 50.0), Pacing::Underusing);
+        assert_eq!(compute_pacing(66.0, 50.0), Pacing::Overusing);
     }
 
     #[test]

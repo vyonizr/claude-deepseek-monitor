@@ -69,23 +69,24 @@
       var T = window.__TAURI__;
       if (!T) return;
       var win = T.window.getCurrentWindow();
-      var isDragging = false, startX, startY, origX, origY;
+      var isDragging = false, startX, startY;
 
-      // Drag via Tauri IPC — capture outer position once, then offset
+      // Drag via Tauri IPC — query position on each move to stay in sync
       document.getElementById('titlebar').addEventListener('mousedown', function(e) {
         if (e.button !== 0) return;
         isDragging = true;
         startX = e.screenX; startY = e.screenY;
-        win.outerPosition().then(function(p) { origX = p.x; origY = p.y; });
         e.preventDefault();
       });
 
       document.addEventListener('mousemove', function(e) {
         if (!isDragging) return;
-        win.setPosition(new T.window.PhysicalPosition(
-          origX + e.screenX - startX,
-          origY + e.screenY - startY
-        ));
+        var dx = e.screenX - startX;
+        var dy = e.screenY - startY;
+        win.outerPosition().then(function(pos) {
+          win.setPosition(new T.window.PhysicalPosition(pos.x + dx, pos.y + dy));
+        });
+        startX = e.screenX; startY = e.screenY;
       });
 
       document.addEventListener('mouseup', function() { isDragging = false; });

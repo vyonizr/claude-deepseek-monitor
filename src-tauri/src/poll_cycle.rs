@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDateTime, Timelike};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Timelike};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pacing {
@@ -131,11 +131,42 @@ fn extract_reset_time(line: &str) -> Option<String> {
 fn parse_reset_datetime(reset_text: &str, local_offset: FixedOffset, current_year: i32) -> Option<DateTime<FixedOffset>> {
     let without_tz = reset_text.split(" (").next()?;
     let clean = without_tz.trim();
-    let naive = NaiveDateTime::parse_from_str(
-        &format!("{} {}", clean, current_year),
-        "%b %d, %I:%M%P %Y",
+
+    // Split on comma: "Jul 18, 4am" → date="Jul 18", time_part="4am"
+    let (date_str, time_str) = {
+        let comma = clean.find(',')?;
+        (&clean[..comma], clean[comma + 1..].trim())
+    };
+
+    let naive_date = NaiveDate::parse_from_str(
+        &format!("{} {}", date_str, current_year),
+        "%b %d %Y",
     ).ok()?;
-    Some(naive.and_local_timezone(local_offset).single()?)
+
+    // Time part may be like "4am", "4:40pm", "8:40pm", "4:00am"
+    let time_lower = time_str.to_lowercase();
+    let is_pm = time_lower.contains("pm");
+    let without_ampm = time_lower
+        .replace("am", "")
+        .replace("pm", "")
+        .trim()
+        .to_string();
+
+    let (hour, minute) = if let Some(pos) = without_ampm.find(':') {
+        let h: u32 = without_ampm[..pos].parse().ok()?;
+        let m: u32 = without_ampm[pos + 1..].parse().ok()?;
+        (h, m)
+    } else {
+        let h: u32 = without_ampm.parse().ok()?;
+        (h, 0)
+    };
+
+    let hour_24 = if is_pm && hour != 12 { hour + 12 }
+        else if !is_pm && hour == 12 { 0 }
+        else { hour };
+
+    let naive = naive_date.and_hms_opt(hour_24, minute, 0)?;
+    naive.and_local_timezone(local_offset).single()
 }
 
 fn compute_pacing(used_pct: f64, elapsed_pct: f64) -> Pacing {
@@ -607,6 +638,16 @@ mod tests {
         assert_eq!(dt.day(), 13);
         assert_eq!(dt.hour(), 20);
         assert_eq!(dt.minute(), 40);
+    }
+
+    #[test]
+    fn test_parse_reset_datetime_whole_hour_no_minutes() {
+        let local_offset = FixedOffset::east_opt(7 * 3600).unwrap();
+        let result = parse_reset_datetime("Jul 18, 4am (Asia/Jakarta)", local_offset, 2026);
+        assert!(result.is_some(), "should parse '4am' without minutes");
+        let dt = result.unwrap();
+        assert_eq!(dt.hour(), 4);
+        assert_eq!(dt.minute(), 0);
     }
 
     #[test]

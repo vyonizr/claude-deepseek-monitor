@@ -46,12 +46,10 @@ pub struct DisplayState {
     pub session_used_pct: Option<f64>,
     pub session_reset_time_text: Option<String>,
     pub session_pacing: Option<Pacing>,
-    pub session_pacing_pct: Option<i32>,
     pub session_window_start: Option<String>,
     pub week_used_pct: Option<f64>,
     pub week_reset_time_text: Option<String>,
     pub week_pacing: Option<Pacing>,
-    pub week_pacing_pct: Option<i32>,
     pub deepseek_status: DeepSeekStatus,
     pub next_transition_info: Option<String>,
     pub stale: bool,
@@ -64,12 +62,10 @@ impl Default for DisplayState {
             session_used_pct: None,
             session_reset_time_text: None,
             session_pacing: None,
-            session_pacing_pct: None,
             session_window_start: None,
             week_used_pct: None,
             week_reset_time_text: None,
             week_pacing: None,
-            week_pacing_pct: None,
             deepseek_status: DeepSeekStatus::OffPeak,
             next_transition_info: None,
             stale: false,
@@ -173,16 +169,15 @@ fn parse_reset_datetime(reset_text: &str, local_offset: FixedOffset, current_yea
     naive.and_local_timezone(local_offset).single()
 }
 
-fn compute_pacing(used_pct: f64, elapsed_pct: f64) -> (Pacing, f64) {
+fn compute_pacing(used_pct: f64, elapsed_pct: f64) -> Pacing {
     let diff = used_pct - elapsed_pct;
-    let pacing = if diff < -PACING_THRESHOLD {
+    if diff < -PACING_THRESHOLD {
         Pacing::Underusing
     } else if diff > PACING_THRESHOLD {
         Pacing::Overusing
     } else {
         Pacing::OnPace
-    };
-    (pacing, diff)
+    }
 }
 
 /// Backoff multiplier caps growth so a persistently broken `claude` subprocess
@@ -317,27 +312,21 @@ pub fn poll_cycle(
         let session_window_start = session_start_str.as_ref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok());
 
-        let (session_pacing, session_pacing_pct) = match (session_window_start, session_reset_dt) {
+        let session_pacing = match (session_window_start, session_reset_dt) {
             (Some(start), Some(reset)) if start < reset => {
                 let total_dur = reset - start;
                 let elapsed = *current_time - start;
                 if total_dur.num_seconds() > 0 {
                     let elapsed_pct = (elapsed.num_seconds() as f64 / total_dur.num_seconds() as f64) * 100.0;
-                    let (pacing, diff) = compute_pacing(sp, elapsed_pct);
-                    let pct = if pacing != Pacing::OnPace {
-                        Some(diff.abs().round() as i32)
-                    } else {
-                        None
-                    };
-                    (Some(pacing), pct)
+                    Some(compute_pacing(sp, elapsed_pct))
                 } else {
-                    (previous_state.session_pacing.clone(), previous_state.session_pacing_pct)
+                    previous_state.session_pacing.clone()
                 }
             }
-            _ => (previous_state.session_pacing.clone(), previous_state.session_pacing_pct),
+            _ => previous_state.session_pacing.clone(),
         };
 
-        let (week_pacing, week_pacing_pct) = match week_reset_dt {
+        let week_pacing = match week_reset_dt {
             Some(reset) => {
                 let window_start = reset - Duration::days(7);
                 let total_dur = reset - window_start;
@@ -345,30 +334,22 @@ pub fn poll_cycle(
                 if total_dur.num_seconds() > 0 {
                     let elapsed_pct = (elapsed.num_seconds() as f64 / total_dur.num_seconds() as f64) * 100.0;
                     let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
-                    let (pacing, diff) = compute_pacing(wp, elapsed_pct);
-                    let pct = if pacing != Pacing::OnPace {
-                        Some(diff.abs().round() as i32)
-                    } else {
-                        None
-                    };
-                    (Some(pacing), pct)
+                    Some(compute_pacing(wp, elapsed_pct))
                 } else {
-                    (previous_state.week_pacing.clone(), previous_state.week_pacing_pct)
+                    previous_state.week_pacing.clone()
                 }
             }
-            _ => (previous_state.week_pacing.clone(), previous_state.week_pacing_pct),
+            _ => previous_state.week_pacing.clone(),
         };
 
         let display = DisplayState {
             session_used_pct: Some(sp),
             session_reset_time_text: Some(sr),
             session_pacing,
-            session_pacing_pct,
             session_window_start: session_start_str,
             week_used_pct: Some(wp),
             week_reset_time_text: Some(wr),
             week_pacing,
-            week_pacing_pct,
             ..Default::default()
         };
 
@@ -538,27 +519,27 @@ mod tests {
 
     #[test]
     fn test_pacing_underusing() {
-        assert_eq!(compute_pacing(10.0, 50.0), (Pacing::Underusing, -40.0));
+        assert_eq!(compute_pacing(10.0, 50.0), Pacing::Underusing);
     }
 
     #[test]
     fn test_pacing_on_pace() {
-        assert_eq!(compute_pacing(45.0, 50.0), (Pacing::OnPace, -5.0));
-        assert_eq!(compute_pacing(55.0, 50.0), (Pacing::OnPace, 5.0));
-        assert_eq!(compute_pacing(50.0, 50.0), (Pacing::OnPace, 0.0));
+        assert_eq!(compute_pacing(45.0, 50.0), Pacing::OnPace);
+        assert_eq!(compute_pacing(55.0, 50.0), Pacing::OnPace);
+        assert_eq!(compute_pacing(50.0, 50.0), Pacing::OnPace);
     }
 
     #[test]
     fn test_pacing_overusing() {
-        assert_eq!(compute_pacing(70.0, 50.0), (Pacing::Overusing, 20.0));
+        assert_eq!(compute_pacing(70.0, 50.0), Pacing::Overusing);
     }
 
     #[test]
     fn test_pacing_boundaries() {
-        assert_eq!(compute_pacing(40.0, 50.0), (Pacing::OnPace, -10.0));
-        assert_eq!(compute_pacing(60.0, 50.0), (Pacing::OnPace, 10.0));
-        assert_eq!(compute_pacing(39.0, 50.0), (Pacing::Underusing, -11.0));
-        assert_eq!(compute_pacing(61.0, 50.0), (Pacing::Overusing, 11.0));
+        assert_eq!(compute_pacing(40.0, 50.0), Pacing::OnPace);
+        assert_eq!(compute_pacing(60.0, 50.0), Pacing::OnPace);
+        assert_eq!(compute_pacing(39.0, 50.0), Pacing::Underusing);
+        assert_eq!(compute_pacing(61.0, 50.0), Pacing::Overusing);
     }
 
     #[test]

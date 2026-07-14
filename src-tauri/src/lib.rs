@@ -92,7 +92,6 @@ fn to_json(state: &poll_cycle::DisplayState) -> serde_json::Value {
             poll_cycle::Pacing::OnPace => "onpace",
             poll_cycle::Pacing::Overusing => "over",
         }),
-        "session_pacing_pct": state.session_pacing_pct,
         "week_pct": state.week_used_pct.map(|v| format!("{:.0}%", v)),
         "week_reset": state.week_reset_time_text,
         "week_pacing": state.week_pacing.as_ref().map(|p| match p {
@@ -100,7 +99,6 @@ fn to_json(state: &poll_cycle::DisplayState) -> serde_json::Value {
             poll_cycle::Pacing::OnPace => "onpace",
             poll_cycle::Pacing::Overusing => "over",
         }),
-        "week_pacing_pct": state.week_pacing_pct,
         "deepseek_peak": matches!(state.deepseek_status, poll_cycle::DeepSeekStatus::Peak { .. }),
         "deepseek_label": match &state.deepseek_status {
             poll_cycle::DeepSeekStatus::Peak { window_label } => Some(window_label),

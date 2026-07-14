@@ -40,12 +40,13 @@
     .ds-indicator.peak { background: #e55; }
     .ds-indicator.offpeak { background: #6f6; }
     .stale { opacity: 0.4; }
+    .amber { color: #f5a623; }
     .diagnostic { position: absolute; bottom: 2px; left: 8px; right: 8px; font-size: 8px; color: #e55; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: none; }
   </style>
 </head>
 <body>
-  <div id="app">
-    <div class="group-header" style="cursor:grab" id="titlebar">CLAUDE</div>
+  <div id="app" data-tauri-drag-region>
+    <div class="group-header">CLAUDE</div>
     <div class="section">
       <div class="label">Session</div>
       <div class="row"><span class="value" id="session-pct">--%</span><span class="pacer" id="session-pacer"></span></div>
@@ -68,17 +69,6 @@
     (function() {
       var T = window.__TAURI__;
       if (!T) return;
-      var win = T.window.getCurrentWindow();
-
-      // Drag via Tauri's built-in startDragging — zero IPC, native OS drag loop
-      document.getElementById('titlebar').addEventListener('mousedown', function(e) {
-        if (e.button !== 0) return;
-        win.startDragging().catch(function(err) {
-          document.getElementById('diagnostic').textContent = 'Drag error: ' + err;
-          document.getElementById('diagnostic').style.display = 'block';
-        });
-        e.preventDefault();
-      });
 
       function applyState(s) {
         document.getElementById('session-pct').textContent = s.session_pct || '--%';
@@ -89,15 +79,13 @@
         var labels = { under: 'UNDER PACE', onpace: 'ON PACE', over: 'OVER PACE' };
         var sp = document.getElementById('session-pacer');
         if (s.session_pacing) {
-          var label = labels[s.session_pacing] || s.session_pacing.toUpperCase();
-          sp.textContent = s.session_pacing_pct != null ? s.session_pacing_pct + '% ' + label : label;
+          sp.textContent = labels[s.session_pacing] || s.session_pacing.toUpperCase();
           sp.className = 'pacer ' + s.session_pacing;
         } else { sp.textContent = ''; sp.className = 'pacer'; }
 
         var wp = document.getElementById('week-pacer');
         if (s.week_pacing) {
-          var label = labels[s.week_pacing] || s.week_pacing.toUpperCase();
-          wp.textContent = s.week_pacing_pct != null ? s.week_pacing_pct + '% ' + label : label;
+          wp.textContent = labels[s.week_pacing] || s.week_pacing.toUpperCase();
           wp.className = 'pacer ' + s.week_pacing;
         } else { wp.textContent = ''; wp.className = 'pacer'; }
 
@@ -109,7 +97,14 @@
           dot.className = 'ds-indicator offpeak';
           document.getElementById('ds-label').textContent = 'Off-peak';
         }
-        document.getElementById('ds-next').textContent = s.next_transition || '';
+
+        var dsNext = document.getElementById('ds-next');
+        dsNext.textContent = s.next_transition || '';
+        if (s.next_transition && /^(Next peak in|Off-peak until) \d+m$/.test(s.next_transition)) {
+          dsNext.classList.add('amber');
+        } else {
+          dsNext.classList.remove('amber');
+        }
 
         var a = document.getElementById('app');
         if (s.stale) { a.classList.add('stale'); } else { a.classList.remove('stale'); }

@@ -21,6 +21,7 @@
       color: #d0d0d0;
       display: flex; flex-direction: column; gap: 4px;
       user-select: none;
+      cursor: grab;
     }
     .group-header {
       font-size: 9px; color: #666; text-transform: uppercase; letter-spacing: 1px;
@@ -45,7 +46,7 @@
   </style>
 </head>
 <body>
-  <div id="app" data-tauri-drag-region>
+  <div id="app">
     <div class="group-header">CLAUDE</div>
     <div class="section">
       <div class="label">Session</div>
@@ -69,6 +70,16 @@
     (function() {
       var T = window.__TAURI__;
       if (!T) return;
+      var win = T.window.getCurrentWindow();
+
+      document.getElementById('app').addEventListener('mousedown', function(e) {
+        if (e.button !== 0) return;
+        win.startDragging().catch(function(err) {
+          document.getElementById('diagnostic').textContent = 'Drag error: ' + err;
+          document.getElementById('diagnostic').style.display = 'block';
+        });
+        e.preventDefault();
+      });
 
       function applyState(s) {
         document.getElementById('session-pct').textContent = s.session_pct || '--%';

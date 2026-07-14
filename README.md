@@ -8,7 +8,7 @@ A compact desktop overlay that shows your Claude Code usage pacing and DeepSeek 
 
 ## Features
 
-- **Claude Code session usage** — % used, time to reset, pacing ("N% UNDER PACE" / "ON PACE" / "N% OVER PACE")
+- **Claude Code session usage** — % used, time to reset, pacing ("UNDER PACE" / "ON PACE" / "OVER PACE")
 - **Claude Code weekly quota** — % used, time to reset, pacing
 - **DeepSeek peak pricing** — persistently shows peak/off-peak status with time to next transition
 - **OS notifications** — fired exactly when a DeepSeek peak window starts or ends (edge-triggered, not every poll)
@@ -64,14 +64,14 @@ The Tauri shell handles all I/O: spawning `claude --print "/usage"`, reading the
 |----------|--------|
 | Framework | [Tauri v2](https://v2.tauri.app) (Rust backend, web frontend) |
 | Poll interval | User-configurable (default 5 minutes, min 1) |
-| Pacing threshold | ±10 percentage points around even pace (percentage shown for OVER/UNDER) |
+| Pacing threshold | ±10 percentage points around even pace (label only, no percentage) |
 | DeepSeek windows | 09:00–12:00 and 14:00–18:00 Beijing time (UTC+8, no DST) |
 | Settings storage | `settings.json` in OS app data directory |
 | Auto-launch | `tauri-plugin-autostart` (on by default) |
 
 ### Testing
 
-Only the pure `poll_cycle()` function is unit-tested (24 tests). The imperative shell is verified manually.
+Only the pure `poll_cycle()` function is unit-tested (29 tests). The imperative shell is verified manually.
 
 ## Building
 

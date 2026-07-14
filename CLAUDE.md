@@ -12,7 +12,7 @@ All commands run from `src-tauri/`:
 
 ```bash
 cargo run              # build and launch the app
-cargo test              # run poll_cycle unit tests (24 tests, functional core only)
+cargo test              # run poll_cycle unit tests (29 tests, functional core only)
 cargo test <test_name>  # run a single test
 cargo build --release   # release binary -> src-tauri/target/release/claude-deepseek-monitor.exe
 ```

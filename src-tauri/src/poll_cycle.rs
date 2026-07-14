@@ -84,6 +84,7 @@ impl DisplayState {
 }
 
 const PACING_THRESHOLD: f64 = 10.0;
+const SESSION_WINDOW_HOURS: i64 = 5;
 
 fn parse_claude_usage_text(text: &str) -> Option<(f64, String, f64, String)> {
     let mut session_pct: Option<f64> = None;
@@ -304,7 +305,7 @@ pub fn poll_cycle(
         let week_reset_dt = parse_reset_datetime(&wr, local_offset, current_year);
 
         let session_start_str = if previous_state.session_reset_time_text.as_deref() != Some(&sr) {
-            Some(current_time.to_rfc3339())
+            session_reset_dt.map(|dt| (dt - Duration::hours(SESSION_WINDOW_HOURS)).to_rfc3339())
         } else {
             previous_state.session_window_start.clone()
         };
@@ -318,6 +319,7 @@ pub fn poll_cycle(
                 let elapsed = *current_time - start;
                 if total_dur.num_seconds() > 0 {
                     let elapsed_pct = (elapsed.num_seconds() as f64 / total_dur.num_seconds() as f64) * 100.0;
+                    let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
                     Some(compute_pacing(sp, elapsed_pct))
                 } else {
                     previous_state.session_pacing.clone()

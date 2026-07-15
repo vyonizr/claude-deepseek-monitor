@@ -86,15 +86,26 @@ impl DisplayState {
 const PACING_THRESHOLD: f64 = 10.0;
 const SESSION_WINDOW_HOURS: i64 = 5;
 
-fn parse_claude_usage_text(text: &str) -> Option<(f64, String, f64, String)> {
+/// Session and week lines are parsed independently so a missing/malformed
+/// session line (e.g. no session started since the last reset) doesn't force
+/// a total parse failure when the week line is perfectly readable.
+struct ParsedUsage {
+    session: Option<(f64, String)>,
+    session_line_present: bool,
+    week: Option<(f64, String)>,
+}
+
+fn parse_usage_sections(text: &str) -> ParsedUsage {
     let mut session_pct: Option<f64> = None;
     let mut session_reset: Option<String> = None;
+    let mut session_line_present = false;
     let mut week_pct: Option<f64> = None;
     let mut week_reset: Option<String> = None;
 
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with("Current session:") {
+            session_line_present = true;
             if let Some(pct) = extract_percentage(line) {
                 session_pct = Some(pct);
             }
@@ -111,8 +122,18 @@ fn parse_claude_usage_text(text: &str) -> Option<(f64, String, f64, String)> {
         }
     }
 
-    match (session_pct, session_reset, week_pct, week_reset) {
-        (Some(sp), Some(sr), Some(wp), Some(wr)) => Some((sp, sr, wp, wr)),
+    ParsedUsage {
+        session: session_pct.zip(session_reset),
+        session_line_present,
+        week: week_pct.zip(week_reset),
+    }
+}
+
+#[cfg(test)]
+fn parse_claude_usage_text(text: &str) -> Option<(f64, String, f64, String)> {
+    let parsed = parse_usage_sections(text);
+    match (parsed.session, parsed.week) {
+        (Some((sp, sr)), Some((wp, wr))) => Some((sp, sr, wp, wr)),
         _ => None,
     }
 }
@@ -296,9 +317,19 @@ pub fn poll_cycle(
     config: &Config,
     previous_state: &DisplayState,
 ) -> (DisplayState, Vec<NotificationEvent>) {
-    let parsed = raw_usage_text.and_then(parse_claude_usage_text);
+    let parsed = raw_usage_text.map(parse_usage_sections);
 
-    let (mut display, usage_ok) = if let Some((sp, sr, wp, wr)) = parsed {
+    let awaiting_session = matches!(
+        &parsed,
+        Some(p) if p.week.is_some() && p.session.is_none() && !p.session_line_present
+    );
+
+    let full = parsed.as_ref().and_then(|p| match (&p.session, &p.week) {
+        (Some((sp, sr)), Some((wp, wr))) => Some((*sp, sr.clone(), *wp, wr.clone())),
+        _ => None,
+    });
+
+    let (mut display, usage_ok) = if let Some((sp, sr, wp, wr)) = full {
         let local_offset = *current_time.offset();
         let current_year = current_time.year();
         let session_reset_dt = parse_reset_datetime(&sr, local_offset, current_year);
@@ -349,6 +380,40 @@ pub fn poll_cycle(
             session_reset_time_text: Some(sr),
             session_pacing,
             session_window_start: session_start_str,
+            week_used_pct: Some(wp),
+            week_reset_time_text: Some(wr),
+            week_pacing,
+            ..Default::default()
+        };
+
+        (display, true)
+    } else if awaiting_session {
+        let (wp, wr) = parsed.as_ref().and_then(|p| p.week.clone()).expect("awaiting_session implies week is Some");
+        let local_offset = *current_time.offset();
+        let current_year = current_time.year();
+        let week_reset_dt = parse_reset_datetime(&wr, local_offset, current_year);
+
+        let week_pacing = match week_reset_dt {
+            Some(reset) => {
+                let window_start = reset - Duration::days(7);
+                let total_dur = reset - window_start;
+                let elapsed = *current_time - window_start;
+                if total_dur.num_seconds() > 0 {
+                    let elapsed_pct = (elapsed.num_seconds() as f64 / total_dur.num_seconds() as f64) * 100.0;
+                    let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
+                    Some(compute_pacing(wp, elapsed_pct))
+                } else {
+                    previous_state.week_pacing.clone()
+                }
+            }
+            _ => previous_state.week_pacing.clone(),
+        };
+
+        let display = DisplayState {
+            session_used_pct: Some(0.0),
+            session_reset_time_text: Some("Not started".to_string()),
+            session_pacing: None,
+            session_window_start: None,
             week_used_pct: Some(wp),
             week_reset_time_text: Some(wr),
             week_pacing,
@@ -455,6 +520,51 @@ mod tests {
     fn test_parse_text_with_missing_percentage() {
         let result = parse_claude_usage_text("Current session: used \u{00b7} resets Jul 13, 8:40pm (Asia/Jakarta)\nCurrent week (all models): 13% used \u{00b7} resets Jul 18, 4am (Asia/Jakarta)");
         assert!(result.is_none());
+    }
+
+    const WEEK_ONLY_USAGE_TEXT: &str = "No active session \u{00b7} run claude to start one\nCurrent week (all models): 13% used \u{00b7} resets Jul 18, 4am (Asia/Jakarta)";
+
+    #[test]
+    fn test_poll_cycle_with_no_session_line_is_awaiting_not_stale() {
+        let now = make_time(14, 0, 0);
+        let config = Config::default();
+        let prev = DisplayState {
+            session_used_pct: Some(8.0),
+            session_reset_time_text: Some("Jul 13, 8:40pm (Asia/Jakarta)".into()),
+            week_used_pct: Some(10.0),
+            week_reset_time_text: Some("Jul 18, 4am (Asia/Jakarta)".into()),
+            ..Default::default()
+        };
+
+        let (display, _events) = poll_cycle(Some(WEEK_ONLY_USAGE_TEXT), &now, &config, &prev);
+
+        assert!(!display.stale, "awaiting session should not be treated as stale");
+        assert_eq!(display.session_used_pct, Some(0.0));
+        assert_eq!(display.session_reset_time_text, Some("Not started".to_string()));
+        assert_eq!(display.session_pacing, None, "no pacing badge while awaiting a session");
+        assert_eq!(display.week_used_pct, Some(13.0), "week should keep updating normally");
+    }
+
+    #[test]
+    fn test_poll_cycle_with_malformed_session_line_still_stale() {
+        let now = make_time(14, 0, 0);
+        let config = Config::default();
+        let prev = DisplayState {
+            session_used_pct: Some(8.0),
+            session_reset_time_text: Some("Jul 13, 8:40pm (Asia/Jakarta)".into()),
+            week_used_pct: Some(10.0),
+            week_reset_time_text: Some("Jul 18, 4am (Asia/Jakarta)".into()),
+            ..Default::default()
+        };
+
+        // Session line present but missing its percentage — a real corruption,
+        // not the clean "no session line at all" case, so it must stay Stale.
+        let text = "Current session: used \u{00b7} resets Jul 13, 8:40pm (Asia/Jakarta)\nCurrent week (all models): 13% used \u{00b7} resets Jul 18, 4am (Asia/Jakarta)";
+
+        let (display, _events) = poll_cycle(Some(text), &now, &config, &prev);
+
+        assert!(display.stale, "malformed session line should remain Stale, not Awaiting session");
+        assert_eq!(display.session_used_pct, Some(8.0), "previous value carried forward while stale");
     }
 
     #[test]

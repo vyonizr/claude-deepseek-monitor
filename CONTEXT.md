@@ -8,6 +8,7 @@
 | Weekly quota | Claude Code's rolling 7-day usage allowance. Resets on a fixed weekly schedule. Shown in `/usage` as "Current week (all models): X% used". |
 | Pacing | Comparison of % of quota used vs % of time elapsed in the window. Classified as **Underusing** (ahead of pace, diff < -10pp, shown as `"UNDER PACE"`), **OnPace** (within ±10pp, shown as `"ON PACE"`), **Overusing** (behind pace, diff > +10pp, shown as `"OVER PACE"`). Rust enum variants serialize to `"under"` / `"onpace"` / `"over"`; `dist/index.html` maps those to the display labels. |
 | Stale | State of the display when the last poll failed to parse `/usage` output. Previous values shown dimmed. |
+| Awaiting session | State of the *session* row specifically when `/usage`'s week line parses successfully but no line starting with `"Current session:"` is present at all (i.e. no session has been started since the last reset). Distinct from Stale: `stale` stays `false`, the widget is not dimmed, `session_used_pct` shows `0`, pacing is suppressed (no ON/UNDER/OVER PACE badge), and the reset-time text reads `"Not started"`. Any messier session-line failure (present but malformed) is still treated as Stale, not Awaiting session. |
 | DeepSeek peak window | One of two daily Beijing-time windows (09:00–12:00 and 14:00–18:00 BJT / 01:00–04:00 and 06:00–10:00 UTC) during which DeepSeek charges 2× standard rate. |
 | Poll cycle | A pure function `(raw_usage_text, current_time, config, previous_state) -> (new_state, notification_events)` — the single unit-testable seam. All app logic lives here. |
 | Imperative shell | The Tauri application layer that spawns subprocesses, reads the clock, fires notifications, and renders the widget. Not unit-tested. |
@@ -54,6 +55,7 @@ If the window hasn't actually started yet (`start >= reset`) or its duration is 
 | ADR-004 | ±10pp pacing threshold, no percentage prefix on labels | Threshold at ±10pp catches attention early without being abrupt. The percentage diff was removed to reduce visual clutter — just "OVER PACE" / "UNDER PACE". |
 | ADR-005 | Beijing time = UTC+8 hardcoded | No DST, no timezone database dependency needed. |
 | ADR-006 | Local issue tracker (markdown files) | No GitHub/Linear configured for this project. |
+| ADR-007 | Detect "Awaiting session" structurally, not by string-matching `/usage`'s exact wording | The dimmed Stale overlay was firing whenever a session reset passed without the user starting a new one, making the widget look unresponsive even though it was polling correctly. The exact replacement text `/usage` prints in that state is unconfirmed, so matching on a specific phrase would be brittle and could silently break if Claude Code rewords it. Instead, the parser was split so session/week lines parse independently; "week parses, no `Current session:` line at all" is the narrow trigger for Awaiting session, while any other session-parse failure still falls back to Stale. |
 
 ## State
 

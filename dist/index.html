@@ -40,7 +40,7 @@
     .ds-indicator { width: 8px; height: 8px; border-radius: 50%; }
     .ds-indicator.peak { background: #e55; }
     .ds-indicator.offpeak { background: #6f6; }
-    .stale { opacity: 0.4; }
+    .stale { }
     .amber { color: #f5a623; }
     .diagnostic { position: absolute; bottom: 2px; left: 8px; right: 8px; font-size: 8px; color: #e55; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: none; }
   </style>
@@ -119,6 +119,7 @@
 
         var a = document.getElementById('app');
         if (s.stale) { a.classList.add('stale'); } else { a.classList.remove('stale'); }
+        a.style.opacity = s.stale ? '0.4' : String(s.widget_opacity ?? 0.92);
 
         var diagEl = document.getElementById('diagnostic');
         if (s.diagnostic) {

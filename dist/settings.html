@@ -57,6 +57,14 @@
     <input type="number" min="1" max="20" id="over-pace-threshold" style="width:60px; background:#333; border:1px solid #444; color:#d0d0d0; padding:3px 5px; border-radius:3px; font-size:11px;" />
   </div>
 
+  <div class="field">
+    <label>Widget Opacity</label>
+    <div style="display:flex;align-items:center;gap:8px">
+      <input type="range" min="0.3" max="1.0" step="0.05" id="widget-opacity" style="flex:1;accent-color:#4a7" />
+      <span id="opacity-value" style="min-width:32px;color:#999;font-size:11px">92%</span>
+    </div>
+  </div>
+
   <div class="toggle-row">
     <label>Auto-launch at login</label>
     <label class="toggle">
@@ -84,6 +92,7 @@
           poll_interval_minutes: data.poll_interval_minutes,
           under_pace_threshold: data.under_pace_threshold,
           over_pace_threshold: data.over_pace_threshold,
+          widget_opacity: data.widget_opacity,
           deepseek_windows: JSON.stringify(data.deepseek_windows.map(function(w) { return { start_hour: w.start_hour, end_hour: w.end_hour }; })),
         };
       }
@@ -94,6 +103,7 @@
           poll_interval_minutes: Math.max(1, parseInt(document.getElementById('poll-interval').value) || 1),
           under_pace_threshold: Math.max(1, Math.min(20, parseInt(document.getElementById('under-pace-threshold').value) || 1)),
           over_pace_threshold: Math.max(1, Math.min(20, parseInt(document.getElementById('over-pace-threshold').value) || 1)),
+          widget_opacity: parseFloat(document.getElementById('widget-opacity').value),
           deepseek_windows: JSON.stringify(data.deepseek_windows.map(function(w) { return { start_hour: w.start_hour, end_hour: w.end_hour }; })),
         };
       }
@@ -105,6 +115,7 @@
           || snap.poll_interval_minutes !== curr.poll_interval_minutes
           || snap.under_pace_threshold !== curr.under_pace_threshold
           || snap.over_pace_threshold !== curr.over_pace_threshold
+          || snap.widget_opacity !== curr.widget_opacity
           || snap.deepseek_windows !== curr.deepseek_windows;
         document.getElementById('btn-save').disabled = !dirty;
       }
@@ -114,6 +125,10 @@
         document.getElementById('poll-interval').addEventListener('input', function() { updateSaveButton(data); });
         document.getElementById('under-pace-threshold').addEventListener('input', function() { updateSaveButton(data); });
         document.getElementById('over-pace-threshold').addEventListener('input', function() { updateSaveButton(data); });
+        document.getElementById('widget-opacity').addEventListener('input', function() {
+          document.getElementById('opacity-value').textContent = Math.round(parseFloat(this.value) * 100) + '%';
+          updateSaveButton(data);
+        });
       }
 
       T.core.invoke('get_settings').then(function(data) {
@@ -123,6 +138,8 @@
         document.getElementById('poll-interval').value = data.poll_interval_minutes;
         document.getElementById('under-pace-threshold').value = data.under_pace_threshold;
         document.getElementById('over-pace-threshold').value = data.over_pace_threshold;
+        document.getElementById('widget-opacity').value = data.widget_opacity;
+        document.getElementById('opacity-value').textContent = Math.round(data.widget_opacity * 100) + '%';
         snapshot = buildSnapshot(data);
         setupDirtyTracking(data);
         updateSaveButton(data);
@@ -177,6 +194,7 @@
         settingsData.poll_interval_minutes = Math.max(1, parseInt(document.getElementById('poll-interval').value) || 1);
         settingsData.under_pace_threshold = Math.max(1, Math.min(20, parseInt(document.getElementById('under-pace-threshold').value) || 1));
         settingsData.over_pace_threshold = Math.max(1, Math.min(20, parseInt(document.getElementById('over-pace-threshold').value) || 1));
+        settingsData.widget_opacity = parseFloat(document.getElementById('widget-opacity').value);
         T.core.invoke('save_settings', { settings: settingsData }).then(function() {
           var btn = document.getElementById('btn-save');
           btn.textContent = 'Saved \u2713';

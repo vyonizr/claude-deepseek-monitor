@@ -26,6 +26,8 @@ struct SavedSettings {
     under_pace_threshold: u32,
     #[serde(default = "default_over_pace_threshold")]
     over_pace_threshold: u32,
+    #[serde(default = "default_widget_opacity")]
+    widget_opacity: f64,
 }
 
 fn default_under_pace_threshold() -> u32 {
@@ -38,6 +40,10 @@ fn default_over_pace_threshold() -> u32 {
 
 fn default_poll_interval_minutes() -> u32 {
     5
+}
+
+fn default_widget_opacity() -> f64 {
+    0.92
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -57,6 +63,7 @@ impl Default for SavedSettings {
             poll_interval_minutes: default_poll_interval_minutes(),
             under_pace_threshold: default_under_pace_threshold(),
             over_pace_threshold: default_over_pace_threshold(),
+            widget_opacity: default_widget_opacity(),
         }
     }
 }
@@ -99,7 +106,8 @@ fn settings_to_config(settings: &SavedSettings) -> poll_cycle::Config {
     }
 }
 
-fn to_json(state: &poll_cycle::DisplayState) -> serde_json::Value {
+fn to_json(state: &poll_cycle::DisplayState, app: &tauri::AppHandle) -> serde_json::Value {
+    let opacity = load_settings(app).widget_opacity;
     serde_json::json!({
         "session_pct": state.session_used_pct.map(|v| format!("{:.0}%", v)),
         "session_reset": state.session_reset_time_text,
@@ -123,18 +131,19 @@ fn to_json(state: &poll_cycle::DisplayState) -> serde_json::Value {
         "next_transition": state.next_transition_info,
         "stale": state.stale,
         "diagnostic": state.diagnostic,
+        "widget_opacity": opacity,
     })
 }
 
 fn emit_state_update(app: &tauri::AppHandle, state: &poll_cycle::DisplayState) {
-    let _ = app.emit("state-update", to_json(state));
+    let _ = app.emit("state-update", to_json(state, app));
 }
 
 #[tauri::command]
 fn get_initial_state(app: tauri::AppHandle) -> serde_json::Value {
     let state = app.state::<Mutex<AppState>>();
     let state = state.lock().unwrap();
-    to_json(&state.poll_cycle_state)
+    to_json(&state.poll_cycle_state, &app)
 }
 
 fn fire_notifications(
@@ -319,6 +328,7 @@ fn get_settings(app: tauri::AppHandle) -> serde_json::Value {
         "poll_interval_minutes": settings.poll_interval_minutes,
         "under_pace_threshold": settings.under_pace_threshold,
         "over_pace_threshold": settings.over_pace_threshold,
+        "widget_opacity": settings.widget_opacity,
     })
 }
 
@@ -348,12 +358,18 @@ fn save_settings(app: tauri::AppHandle, settings: serde_json::Value) -> Result<(
         .map(|v| (v as u32).clamp(1, 20))
         .unwrap_or_else(default_over_pace_threshold);
 
+    let widget_opacity = settings.get("widget_opacity")
+        .and_then(|v| v.as_f64())
+        .map(|v| v.clamp(0.3, 1.0))
+        .unwrap_or_else(default_widget_opacity);
+
     let saved = SavedSettings {
         deepseek_windows: windows,
         auto_launch,
         poll_interval_minutes,
         under_pace_threshold,
         over_pace_threshold,
+        widget_opacity,
     };
 
     save_settings_to_disk(&app, &saved);

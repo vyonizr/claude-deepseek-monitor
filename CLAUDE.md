@@ -40,3 +40,17 @@ Poll interval, DeepSeek windows, and auto-launch are all user-configurable via t
 ## Testing notes
 
 Only `poll_cycle()` is unit-tested. The imperative shell (`lib.rs`) is verified manually by running the app — there is no automated test harness for tray/subprocess/notification behavior.
+
+## Agent skills
+
+### Issue tracker
+
+Local markdown issues under `.scratch/<feature>/issues/`, gitignored. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default five-role vocabulary (needs-triage, needs-info, ready-for-agent, ready-for-human, wontfix). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context — one `CONTEXT.md` at repo root (no separate `docs/adr/`; ADRs are embedded in its Decisions table). See `docs/agents/domain.md`.

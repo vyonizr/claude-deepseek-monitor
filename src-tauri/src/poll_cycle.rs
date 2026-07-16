@@ -461,6 +461,27 @@ pub fn poll_cycle(
     (display, events)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+pub fn is_position_visible(window_rect: &Rect, monitor_rects: &[Rect]) -> bool {
+    monitor_rects.iter().any(|m| rects_overlap(window_rect, m))
+}
+
+fn rects_overlap(a: &Rect, b: &Rect) -> bool {
+    let a_x2 = a.x.saturating_add(a.width as i32);
+    let a_y2 = a.y.saturating_add(a.height as i32);
+    let b_x2 = b.x.saturating_add(b.width as i32);
+    let b_y2 = b.y.saturating_add(b.height as i32);
+
+    a.x < b_x2 && a_x2 > b.x && a.y < b_y2 && a_y2 > b.y
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,5 +861,72 @@ mod tests {
         assert_eq!(dt.day(), 18);
         assert_eq!(dt.hour(), 4);
         assert_eq!(dt.minute(), 0);
+    }
+
+    #[test]
+    fn test_rects_overlap_full_containment() {
+        let a = Rect { x: 100, y: 100, width: 240, height: 185 };
+        let b = Rect { x: 0, y: 0, width: 1920, height: 1080 };
+        assert!(rects_overlap(&a, &b));
+        assert!(rects_overlap(&b, &a));
+    }
+
+    #[test]
+    fn test_rects_no_overlap_separate() {
+        let a = Rect { x: -2000, y: -2000, width: 240, height: 185 };
+        let b = Rect { x: 0, y: 0, width: 1920, height: 1080 };
+        assert!(!rects_overlap(&a, &b));
+    }
+
+    #[test]
+    fn test_rects_overlap_partial_edge() {
+        let a = Rect { x: 1800, y: 100, width: 240, height: 185 };
+        let b = Rect { x: 0, y: 0, width: 1920, height: 1080 };
+        assert!(rects_overlap(&a, &b));
+    }
+
+    #[test]
+    fn test_rects_touching_edge_no_overlap() {
+        let a = Rect { x: 1920, y: 0, width: 240, height: 185 };
+        let b = Rect { x: 0, y: 0, width: 1920, height: 1080 };
+        assert!(!rects_overlap(&a, &b));
+    }
+
+    #[test]
+    fn test_is_position_visible_fully_on_one_monitor() {
+        let window = Rect { x: 100, y: 100, width: 240, height: 185 };
+        let monitors = vec![Rect { x: 0, y: 0, width: 1920, height: 1080 }];
+        assert!(is_position_visible(&window, &monitors));
+    }
+
+    #[test]
+    fn test_is_position_visible_fully_off_all_monitors() {
+        let window = Rect { x: -2000, y: -2000, width: 240, height: 185 };
+        let monitors = vec![Rect { x: 0, y: 0, width: 1920, height: 1080 }];
+        assert!(!is_position_visible(&window, &monitors));
+    }
+
+    #[test]
+    fn test_is_position_visible_partially_overlapping_edge() {
+        let window = Rect { x: 1800, y: 100, width: 240, height: 185 };
+        let monitors = vec![Rect { x: 0, y: 0, width: 1920, height: 1080 }];
+        assert!(is_position_visible(&window, &monitors));
+    }
+
+    #[test]
+    fn test_is_position_visible_spanning_two_adjacent_monitors() {
+        let window = Rect { x: 1900, y: 100, width: 240, height: 185 };
+        let monitors = vec![
+            Rect { x: 0, y: 0, width: 1920, height: 1080 },
+            Rect { x: 1920, y: 0, width: 1920, height: 1080 },
+        ];
+        assert!(is_position_visible(&window, &monitors));
+    }
+
+    #[test]
+    fn test_is_position_visible_empty_monitor_list() {
+        let window = Rect { x: 100, y: 100, width: 240, height: 185 };
+        let monitors: Vec<Rect> = vec![];
+        assert!(!is_position_visible(&window, &monitors));
     }
 }

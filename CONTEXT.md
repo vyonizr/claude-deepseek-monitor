@@ -60,6 +60,7 @@ If the window hasn't actually started yet (`start >= reset`) or its duration is 
 | ADR-005 | Beijing time = UTC+8 hardcoded | No DST, no timezone database dependency needed. |
 | ADR-006 | Local issue tracker (markdown files) | No GitHub/Linear configured for this project. |
 | ADR-007 | Detect "Awaiting session" structurally, not by string-matching `/usage`'s exact wording | The dimmed Stale overlay was firing whenever a session reset passed without the user starting a new one, making the widget look unresponsive even though it was polling correctly. The exact replacement text `/usage` prints in that state is unconfirmed, so matching on a specific phrase would be brittle and could silently break if Claude Code rewords it. Instead, the parser was split so session/week lines parse independently; "week parses, no `Current session:` line at all" is the narrow trigger for Awaiting session, while any other session-parse failure still falls back to Stale. |
+| ADR-008 | Window position persisted via `tauri-plugin-window-state` (position only), with an off-screen safety check in `poll_cycle.rs` | Widget has no title bar/taskbar entry to manually reposition if it restores off-screen (e.g. after a monitor is unplugged); falls back to top-right corner of primary monitor when the restored rect doesn't overlap any current monitor. |
 
 ## State
 

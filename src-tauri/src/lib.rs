@@ -6,7 +6,7 @@ use tauri::{
     image::Image,
     menu::Menu,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, Manager, WebviewUrl, WebviewWindowBuilder,
+    Emitter, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder,
 };
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_autostart::ManagerExt;
@@ -380,6 +380,10 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![]),
         ))
+        .plugin(tauri_plugin_window_state::Builder::default()
+            .with_state_flags(tauri_plugin_window_state::StateFlags::POSITION)
+            .with_denylist(&["settings"])
+            .build())
         .manage(Mutex::new(AppState {
             poll_cycle_state: poll_cycle::DisplayState::default(),
             consecutive_failures: 0,
@@ -445,6 +449,38 @@ pub fn run() {
                     _ => {}
                 })
                 .build(app)?;
+
+            if let Some(window) = app.get_webview_window("main") {
+                let monitors = app.available_monitors().unwrap_or_default();
+                if let (Ok(pos), Ok(size)) = (window.outer_position(), window.outer_size()) {
+                    let window_rect = poll_cycle::Rect {
+                        x: pos.x,
+                        y: pos.y,
+                        width: size.width,
+                        height: size.height,
+                    };
+                    let monitor_rects: Vec<poll_cycle::Rect> = monitors.iter().map(|m| {
+                        let mpos = m.position();
+                        let msize = m.size();
+                        poll_cycle::Rect {
+                            x: mpos.x,
+                            y: mpos.y,
+                            width: msize.width,
+                            height: msize.height,
+                        }
+                    }).collect();
+                    if !poll_cycle::is_position_visible(&window_rect, &monitor_rects) {
+                        if let Some(primary) = app.primary_monitor().unwrap_or(None) {
+                            let ppos = primary.position();
+                            let psize = primary.size();
+                            let margin = 20i32;
+                            let new_x = (ppos.x + psize.width as i32 - 240i32 - margin).max(ppos.x);
+                            let new_y = ppos.y + margin;
+                            let _ = window.set_position(PhysicalPosition::new(new_x, new_y));
+                        }
+                    }
+                }
+            }
 
             // Run initial poll
             run_poll_cycle(app.handle());

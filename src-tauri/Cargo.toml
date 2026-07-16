@@ -19,3 +19,21 @@ tauri-plugin-autostart = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
+
+# Cuts target/debug footprint (no full symbol tables) without slowing
+# incremental builds; keep line info so panics still show file:line.
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies rarely change during dev: compile them once with debug info
+# stripped and light optimization, then they're cached and don't bloat
+# target/debug or slow down your own crate's incremental rebuilds.
+[profile.dev.package."*"]
+debug = false
+opt-level = 1
+
+[profile.release]
+strip = true       # drop symbols from the shipped binary
+lto = "thin"        # smaller/faster binary, cheap compile-time cost
+codegen-units = 1
+panic = "abort"     # no unwinding tables, no need to catch panics in this app

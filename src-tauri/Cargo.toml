@@ -1,6 +1,6 @@
 [package]
 name = "claude-deepseek-monitor"
-version = "0.2.0"
+version = "0.2.1"
 description = "Claude Code / DeepSeek Compact Usage Overlay"
 edition = "2021"
 

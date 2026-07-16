@@ -28,6 +28,8 @@ pub struct DeepSeekWindow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub deepseek_windows: Vec<DeepSeekWindow>,
+    pub under_pace_threshold: f64,
+    pub over_pace_threshold: f64,
 }
 
 impl Default for Config {
@@ -37,6 +39,8 @@ impl Default for Config {
                 DeepSeekWindow { start_hour: 9, end_hour: 12 },
                 DeepSeekWindow { start_hour: 14, end_hour: 18 },
             ],
+            under_pace_threshold: 1.0,
+            over_pace_threshold: 1.0,
         }
     }
 }
@@ -83,7 +87,6 @@ impl DisplayState {
     }
 }
 
-const PACING_THRESHOLD: f64 = 1.0;
 const SESSION_WINDOW_HOURS: i64 = 5;
 
 /// Session and week lines are parsed independently so a missing/malformed
@@ -191,14 +194,14 @@ fn parse_reset_datetime(reset_text: &str, local_offset: FixedOffset, current_yea
     naive.and_local_timezone(local_offset).single()
 }
 
-fn compute_pacing(used_pct: f64, elapsed_pct: f64) -> Pacing {
+fn compute_pacing(used_pct: f64, elapsed_pct: f64, under_threshold: f64, over_threshold: f64) -> Pacing {
     if used_pct >= 100.0 && elapsed_pct < 100.0 {
         return Pacing::Overusing;
     }
     let diff = used_pct - elapsed_pct;
-    if diff < -PACING_THRESHOLD {
+    if diff < -under_threshold {
         Pacing::Underusing
-    } else if diff > PACING_THRESHOLD {
+    } else if diff > over_threshold {
         Pacing::Overusing
     } else {
         Pacing::OnPace
@@ -354,7 +357,7 @@ pub fn poll_cycle(
                 if total_dur.num_seconds() > 0 {
                     let elapsed_pct = (elapsed.num_seconds() as f64 / total_dur.num_seconds() as f64) * 100.0;
                     let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
-                    Some(compute_pacing(sp, elapsed_pct))
+                    Some(compute_pacing(sp, elapsed_pct, config.under_pace_threshold, config.over_pace_threshold))
                 } else {
                     previous_state.session_pacing.clone()
                 }
@@ -370,7 +373,7 @@ pub fn poll_cycle(
                 if total_dur.num_seconds() > 0 {
                     let elapsed_pct = (elapsed.num_seconds() as f64 / total_dur.num_seconds() as f64) * 100.0;
                     let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
-                    Some(compute_pacing(wp, elapsed_pct))
+                    Some(compute_pacing(wp, elapsed_pct, config.under_pace_threshold, config.over_pace_threshold))
                 } else {
                     previous_state.week_pacing.clone()
                 }
@@ -404,7 +407,7 @@ pub fn poll_cycle(
                 if total_dur.num_seconds() > 0 {
                     let elapsed_pct = (elapsed.num_seconds() as f64 / total_dur.num_seconds() as f64) * 100.0;
                     let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
-                    Some(compute_pacing(wp, elapsed_pct))
+                    Some(compute_pacing(wp, elapsed_pct, config.under_pace_threshold, config.over_pace_threshold))
                 } else {
                     previous_state.week_pacing.clone()
                 }
@@ -634,37 +637,45 @@ mod tests {
 
     #[test]
     fn test_pacing_underusing() {
-        assert_eq!(compute_pacing(10.0, 50.0), Pacing::Underusing);
+        assert_eq!(compute_pacing(10.0, 50.0, 1.0, 1.0), Pacing::Underusing);
     }
 
     #[test]
     fn test_pacing_on_pace() {
-        assert_eq!(compute_pacing(50.0, 50.0), Pacing::OnPace);
-        assert_eq!(compute_pacing(50.5, 50.0), Pacing::OnPace);
-        assert_eq!(compute_pacing(49.5, 50.0), Pacing::OnPace);
+        assert_eq!(compute_pacing(50.0, 50.0, 1.0, 1.0), Pacing::OnPace);
+        assert_eq!(compute_pacing(50.5, 50.0, 1.0, 1.0), Pacing::OnPace);
+        assert_eq!(compute_pacing(49.5, 50.0, 1.0, 1.0), Pacing::OnPace);
     }
 
     #[test]
     fn test_pacing_overusing() {
-        assert_eq!(compute_pacing(70.0, 50.0), Pacing::Overusing);
+        assert_eq!(compute_pacing(70.0, 50.0, 1.0, 1.0), Pacing::Overusing);
     }
 
     #[test]
     fn test_pacing_boundaries() {
-        assert_eq!(compute_pacing(49.0, 50.0), Pacing::OnPace);
-        assert_eq!(compute_pacing(51.0, 50.0), Pacing::OnPace);
-        assert_eq!(compute_pacing(48.0, 50.0), Pacing::Underusing);
-        assert_eq!(compute_pacing(52.0, 50.0), Pacing::Overusing);
+        assert_eq!(compute_pacing(49.0, 50.0, 1.0, 1.0), Pacing::OnPace);
+        assert_eq!(compute_pacing(51.0, 50.0, 1.0, 1.0), Pacing::OnPace);
+        assert_eq!(compute_pacing(48.0, 50.0, 1.0, 1.0), Pacing::Underusing);
+        assert_eq!(compute_pacing(52.0, 50.0, 1.0, 1.0), Pacing::Overusing);
     }
 
     #[test]
     fn test_pacing_100_percent_before_reset_overusing() {
-        assert_eq!(compute_pacing(100.0, 50.0), Pacing::Overusing);
+        assert_eq!(compute_pacing(100.0, 50.0, 1.0, 1.0), Pacing::Overusing);
     }
 
     #[test]
     fn test_pacing_100_percent_at_reset_time_on_pace() {
-        assert_eq!(compute_pacing(100.0, 100.0), Pacing::OnPace);
+        assert_eq!(compute_pacing(100.0, 100.0, 1.0, 1.0), Pacing::OnPace);
+    }
+
+    #[test]
+    fn test_pacing_non_default_thresholds() {
+        assert_eq!(compute_pacing(45.0, 50.0, 5.0, 10.0), Pacing::OnPace, "diff -5, under=5 → OnPace (diff >= -5)");
+        assert_eq!(compute_pacing(44.0, 50.0, 5.0, 10.0), Pacing::Underusing, "diff -6, under=5 → Underusing");
+        assert_eq!(compute_pacing(60.0, 50.0, 5.0, 10.0), Pacing::OnPace, "diff +10, over=10 → OnPace (diff <= 10)");
+        assert_eq!(compute_pacing(61.0, 50.0, 5.0, 10.0), Pacing::Overusing, "diff +11, over=10 → Overusing");
     }
 
     #[test]

@@ -22,6 +22,18 @@ struct SavedSettings {
     auto_launch: bool,
     #[serde(default = "default_poll_interval_minutes")]
     poll_interval_minutes: u32,
+    #[serde(default = "default_under_pace_threshold")]
+    under_pace_threshold: u32,
+    #[serde(default = "default_over_pace_threshold")]
+    over_pace_threshold: u32,
+}
+
+fn default_under_pace_threshold() -> u32 {
+    1
+}
+
+fn default_over_pace_threshold() -> u32 {
+    1
 }
 
 fn default_poll_interval_minutes() -> u32 {
@@ -43,6 +55,8 @@ impl Default for SavedSettings {
             ],
             auto_launch: true,
             poll_interval_minutes: default_poll_interval_minutes(),
+            under_pace_threshold: default_under_pace_threshold(),
+            over_pace_threshold: default_over_pace_threshold(),
         }
     }
 }
@@ -80,6 +94,8 @@ fn settings_to_config(settings: &SavedSettings) -> poll_cycle::Config {
                 end_hour: w.end_hour,
             }
         }).collect(),
+        under_pace_threshold: settings.under_pace_threshold as f64,
+        over_pace_threshold: settings.over_pace_threshold as f64,
     }
 }
 
@@ -301,6 +317,8 @@ fn get_settings(app: tauri::AppHandle) -> serde_json::Value {
         }).collect::<Vec<_>>(),
         "auto_launch": settings.auto_launch,
         "poll_interval_minutes": settings.poll_interval_minutes,
+        "under_pace_threshold": settings.under_pace_threshold,
+        "over_pace_threshold": settings.over_pace_threshold,
     })
 }
 
@@ -320,10 +338,22 @@ fn save_settings(app: tauri::AppHandle, settings: serde_json::Value) -> Result<(
         .map(|v| (v as u32).max(1))
         .unwrap_or_else(default_poll_interval_minutes);
 
+    let under_pace_threshold = settings.get("under_pace_threshold")
+        .and_then(|v| v.as_u64())
+        .map(|v| (v as u32).clamp(1, 20))
+        .unwrap_or_else(default_under_pace_threshold);
+
+    let over_pace_threshold = settings.get("over_pace_threshold")
+        .and_then(|v| v.as_u64())
+        .map(|v| (v as u32).clamp(1, 20))
+        .unwrap_or_else(default_over_pace_threshold);
+
     let saved = SavedSettings {
         deepseek_windows: windows,
         auto_launch,
         poll_interval_minutes,
+        under_pace_threshold,
+        over_pace_threshold,
     };
 
     save_settings_to_disk(&app, &saved);
@@ -404,7 +434,7 @@ pub fn run() {
                             WebviewUrl::App("settings.html".into()),
                         )
                         .title("Settings")
-                        .inner_size(320.0, 320.0)
+                        .inner_size(320.0, 360.0)
                         .resizable(false)
                         .build();
                     }

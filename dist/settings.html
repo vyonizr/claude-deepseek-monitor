@@ -47,6 +47,16 @@
     <input type="number" min="1" id="poll-interval" style="width:60px; background:#333; border:1px solid #444; color:#d0d0d0; padding:3px 5px; border-radius:3px; font-size:11px;" />
   </div>
 
+  <div class="field">
+    <label>Under Pace Threshold (pp)</label>
+    <input type="number" min="1" max="20" id="under-pace-threshold" style="width:60px; background:#333; border:1px solid #444; color:#d0d0d0; padding:3px 5px; border-radius:3px; font-size:11px;" />
+  </div>
+
+  <div class="field">
+    <label>Over Pace Threshold (pp)</label>
+    <input type="number" min="1" max="20" id="over-pace-threshold" style="width:60px; background:#333; border:1px solid #444; color:#d0d0d0; padding:3px 5px; border-radius:3px; font-size:11px;" />
+  </div>
+
   <div class="toggle-row">
     <label>Auto-launch at login</label>
     <label class="toggle">
@@ -57,7 +67,7 @@
 
   <div class="actions">
     <button class="btn-secondary" id="btn-cancel">Cancel</button>
-    <button class="btn-primary" id="btn-save">Save</button>
+    <button class="btn-primary" id="btn-save" disabled>Save</button>
   </div>
 
   <script>
@@ -66,12 +76,56 @@
       if (!T) return;
       var win = T.window.getCurrentWindow();
       var settingsData = null;
+      var snapshot = null;
+
+      function buildSnapshot(data) {
+        return {
+          auto_launch: data.auto_launch,
+          poll_interval_minutes: data.poll_interval_minutes,
+          under_pace_threshold: data.under_pace_threshold,
+          over_pace_threshold: data.over_pace_threshold,
+          deepseek_windows: JSON.stringify(data.deepseek_windows.map(function(w) { return { start_hour: w.start_hour, end_hour: w.end_hour }; })),
+        };
+      }
+
+      function currentFormState(data) {
+        return {
+          auto_launch: document.getElementById('auto-launch').checked,
+          poll_interval_minutes: Math.max(1, parseInt(document.getElementById('poll-interval').value) || 1),
+          under_pace_threshold: Math.max(1, Math.min(20, parseInt(document.getElementById('under-pace-threshold').value) || 1)),
+          over_pace_threshold: Math.max(1, Math.min(20, parseInt(document.getElementById('over-pace-threshold').value) || 1)),
+          deepseek_windows: JSON.stringify(data.deepseek_windows.map(function(w) { return { start_hour: w.start_hour, end_hour: w.end_hour }; })),
+        };
+      }
+
+      function updateSaveButton(data) {
+        var snap = snapshot || buildSnapshot(data);
+        var curr = currentFormState(data);
+        var dirty = snap.auto_launch !== curr.auto_launch
+          || snap.poll_interval_minutes !== curr.poll_interval_minutes
+          || snap.under_pace_threshold !== curr.under_pace_threshold
+          || snap.over_pace_threshold !== curr.over_pace_threshold
+          || snap.deepseek_windows !== curr.deepseek_windows;
+        document.getElementById('btn-save').disabled = !dirty;
+      }
+
+      function setupDirtyTracking(data) {
+        document.getElementById('auto-launch').addEventListener('change', function() { updateSaveButton(data); });
+        document.getElementById('poll-interval').addEventListener('input', function() { updateSaveButton(data); });
+        document.getElementById('under-pace-threshold').addEventListener('input', function() { updateSaveButton(data); });
+        document.getElementById('over-pace-threshold').addEventListener('input', function() { updateSaveButton(data); });
+      }
 
       T.core.invoke('get_settings').then(function(data) {
         settingsData = data;
         renderWindows();
         document.getElementById('auto-launch').checked = data.auto_launch;
         document.getElementById('poll-interval').value = data.poll_interval_minutes;
+        document.getElementById('under-pace-threshold').value = data.under_pace_threshold;
+        document.getElementById('over-pace-threshold').value = data.over_pace_threshold;
+        snapshot = buildSnapshot(data);
+        setupDirtyTracking(data);
+        updateSaveButton(data);
       });
 
       function makeHourInput(idx, field, value) {
@@ -84,6 +138,7 @@
         inp.dataset.field = field;
         inp.addEventListener('change', function() {
           settingsData.deepseek_windows[idx][field] = parseInt(inp.value);
+          updateSaveButton(settingsData);
         });
         return inp;
       }
@@ -120,8 +175,13 @@
       document.getElementById('btn-save').addEventListener('click', function() {
         settingsData.auto_launch = document.getElementById('auto-launch').checked;
         settingsData.poll_interval_minutes = Math.max(1, parseInt(document.getElementById('poll-interval').value) || 1);
+        settingsData.under_pace_threshold = Math.max(1, Math.min(20, parseInt(document.getElementById('under-pace-threshold').value) || 1));
+        settingsData.over_pace_threshold = Math.max(1, Math.min(20, parseInt(document.getElementById('over-pace-threshold').value) || 1));
         T.core.invoke('save_settings', { settings: settingsData }).then(function() {
-          win.close();
+          var btn = document.getElementById('btn-save');
+          btn.textContent = 'Saved \u2713';
+          btn.disabled = true;
+          setTimeout(function() { win.close(); }, 800);
         });
       });
 

@@ -6,7 +6,7 @@
 |------|------------|
 | Session window | Claude Code's per-session usage quota. Resets after the session lifetime (~hours). Shown in `/usage` as "Current session: X% used". |
 | Weekly quota | Claude Code's rolling 7-day usage allowance. Resets on a fixed weekly schedule. Shown in `/usage` as "Current week (all models): X% used". |
-| Pacing | Comparison of % of quota used vs % of time elapsed in the window. Classified as **Underusing** (ahead of pace, diff < -1pp), **OnPace** (within ±1pp), **Overusing** (behind pace, diff > +1pp). A special override: if `used_pct >= 100%` before the window ends, pacing is **Overusing** regardless of diff. Rust enum variants serialize to `"under"` / `"onpace"` / `"over"`; `dist/index.html` maps those to the display labels. |
+| Pacing | Comparison of % of quota used vs % of time elapsed in the window. Classified as **Underusing** (diff < -under_threshold), **OnPace** (within the configured range), **Overusing** (diff > +over_threshold). Under and Over thresholds are independently configurable (1–20pp, default 1pp each). A special override: if `used_pct >= 100%` before the window ends, pacing is **Overusing** regardless of diff. Rust enum variants serialize to `"under"` / `"onpace"` / `"over"`; `dist/index.html` maps those to the display labels. |
 | Stale | State of the display when the last poll failed to parse `/usage` output. Previous values shown dimmed. |
 | Awaiting session | State of the *session* row specifically when `/usage`'s week line parses successfully but no line starting with `"Current session:"` is present at all (i.e. no session has been started since the last reset). Distinct from Stale: `stale` stays `false`, the widget is not dimmed, `session_used_pct` shows `0`, pacing is suppressed (no ON/UNDER/OVER PACE badge), and the reset-time text reads `"Not started"`. Any messier session-line failure (present but malformed) is still treated as Stale, not Awaiting session. |
 | DeepSeek peak window | One of two daily Beijing-time windows (09:00–12:00 and 14:00–18:00 BJT / 01:00–04:00 and 06:00–10:00 UTC) during which DeepSeek charges 2× standard rate. |
@@ -26,13 +26,15 @@
 
 ## How pacing is calculated
 
-`compute_pacing(used_pct, elapsed_pct)` compares two percentages and buckets the `diff = used_pct - elapsed_pct` against `PACING_THRESHOLD` (currently `1.0`):
+`compute_pacing(used_pct, elapsed_pct, under_threshold, over_threshold)` compares two percentages and buckets the `diff = used_pct - elapsed_pct` against the two thresholds:
 
-- `diff < -1` → **Underusing**
-- `diff > +1` → **Overusing**
-- otherwise → **OnPace** (boundary values of exactly ±1 are `OnPace`, since the comparison is strict `<`/`>`)
+- `diff < -under_threshold` → **Underusing**
+- `diff > +over_threshold` → **Overusing**
+- otherwise → **OnPace** (boundary values of exactly ±threshold are `OnPace`, since the comparison is strict `<`/`>`)
 
-A special override: if `used_pct >= 100.0` and `elapsed_pct < 100.0`, pacing is **Overusing** — the quota is exhausted before the window ends, so you're definitively behind pace regardless of the diff.
+Both thresholds are user-configurable (1–20pp, default 1pp each) via the Settings panel, replacing the formerly hardcoded `PACING_THRESHOLD = 1.0`.
+
+A special override: if `used_pct >= 100.0` and `elapsed_pct < 100.0`, pacing is **Overusing** — the quota is exhausted before the window ends, so you're definitively behind pace regardless of the diff. This override is unchanged by configurable thresholds.
 
 Only the label is displayed — the percentage diff is not shown in the UI.
 
@@ -54,7 +56,7 @@ If the window hasn't actually started yet (`start >= reset`) or its duration is 
 | ADR-001 | Tauri v2 (not Electron) for desktop shell | Smaller binary, lower idle memory, native tray and always-on-top support. |
 | ADR-002 | Single pure function as test seam | Avoids mocking subprocess/clock/notifications. Tests supply inputs, assert outputs. |
 | ADR-003 | User-configurable poll interval (default 5 min, min 1) | Lets users trade CLI spawn frequency for freshness; poll thread re-reads the interval from settings each cycle so changes apply without restart. |
-| ADR-004 | ±1pp pacing threshold, no percentage prefix on labels | Tight threshold (±1pp) catches overshoot the moment it deviates from even pace, with a 100%-override guard so exhausted-quota-before-reset is always flagged as Overusing. The percentage diff was removed to reduce visual clutter — just "OVER PACE" / "UNDER PACE". |
+| ADR-004 | Configurable pacing thresholds (1–20pp), no percentage prefix on labels | Users configure their own sensitivity via the Settings panel (defaults 1pp each, matching the original hardcoded threshold). The 100%-override guard and the no-percentage-clutter-in-labels decision are unchanged. |
 | ADR-005 | Beijing time = UTC+8 hardcoded | No DST, no timezone database dependency needed. |
 | ADR-006 | Local issue tracker (markdown files) | No GitHub/Linear configured for this project. |
 | ADR-007 | Detect "Awaiting session" structurally, not by string-matching `/usage`'s exact wording | The dimmed Stale overlay was firing whenever a session reset passed without the user starting a new one, making the widget look unresponsive even though it was polling correctly. The exact replacement text `/usage` prints in that state is unconfirmed, so matching on a specific phrase would be brittle and could silently break if Claude Code rewords it. Instead, the parser was split so session/week lines parse independently; "week parses, no `Current session:` line at all" is the narrow trigger for Awaiting session, while any other session-parse failure still falls back to Stale. |

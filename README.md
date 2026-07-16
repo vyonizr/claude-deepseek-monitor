@@ -38,7 +38,7 @@ cargo test
 src-tauri/src/
 ├── main.rs              # Binary entry point
 ├── lib.rs               # Tauri app shell: tray, polling, settings, notifications
-└── poll_cycle.rs        # Pure poll-cycle function + 24 unit tests (functional core)
+└── poll_cycle.rs        # Pure poll-cycle function + 33 unit tests (functional core)
 
 dist/
 ├── index.html           # Floating widget UI
@@ -64,14 +64,14 @@ The Tauri shell handles all I/O: spawning `claude --print "/usage"`, reading the
 |----------|--------|
 | Framework | [Tauri v2](https://v2.tauri.app) (Rust backend, web frontend) |
 | Poll interval | User-configurable (default 5 minutes, min 1) |
-| Pacing threshold | ±10 percentage points around even pace (label only, no percentage) |
+| Pacing threshold | ±1 percentage point around even pace (label only, no percentage); 100%-used override forces Overusing |
 | DeepSeek windows | 09:00–12:00 and 14:00–18:00 Beijing time (UTC+8, no DST) |
 | Settings storage | `settings.json` in OS app data directory |
 | Auto-launch | `tauri-plugin-autostart` (on by default) |
 
 ### Testing
 
-Only the pure `poll_cycle()` function is unit-tested (29 tests). The imperative shell is verified manually.
+Only the pure `poll_cycle()` function is unit-tested (33 tests). The imperative shell is verified manually.
 
 ## Building
 

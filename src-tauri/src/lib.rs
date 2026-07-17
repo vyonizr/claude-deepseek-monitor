@@ -375,6 +375,12 @@ fn save_settings(app: tauri::AppHandle, settings: serde_json::Value) -> Result<(
     save_settings_to_disk(&app, &saved);
 
     {
+        let state = app.state::<Mutex<AppState>>();
+        let current = state.lock().unwrap().poll_cycle_state.clone();
+        emit_state_update(&app, &current);
+    }
+
+    {
         let autostart = app.autolaunch();
         let current = autostart.is_enabled().unwrap_or(false);
         if auto_launch && !current {

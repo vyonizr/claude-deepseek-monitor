@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Monitor</title>
+  <title>Claude / Codex / DeepSeek Monitor</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body { 
@@ -40,10 +40,15 @@
     .ds-indicator { width: 8px; height: 8px; border-radius: 50%; }
     .ds-indicator.peak { background: #e55; }
     .ds-indicator.offpeak { background: #6f6; }
-    .stale { }
+    #app.claude-stale { opacity: 0.4; }
     .amber { color: #f5a623; }
     .diagnostic { position: absolute; bottom: 2px; left: 8px; right: 8px; font-size: 8px; color: #e55; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: none; }
-    #codex-section { display: none; }
+    #codex-section { display: none; padding-top: 2px; }
+    #codex-section.codex-loading { border-left: 2px solid #f5a623; padding-left: 6px; }
+    #codex-section.codex-unavailable { border-left: 2px solid #e55; padding-left: 6px; }
+    #codex-section.codex-stale { border-left: 2px solid #f5a623; padding-left: 6px; }
+    #codex-section.codex-stale #codex-windows { opacity: 0.45; }
+    #codex-section.codex-unavailable .source-diagnostic { color: #f5a623; }
     .source-diagnostic { font-size: 9px; color: #e55; }
     .codex-window { display: flex; flex-direction: column; gap: 1px; }
   </style>
@@ -79,6 +84,13 @@
       var T = window.__TAURI__;
       if (!T) return;
       var win = T.window.getCurrentWindow();
+      var currentWidgetHeight = 185;
+
+      function resizeWidget(height) {
+        if (height === currentWidgetHeight) return;
+        currentWidgetHeight = height;
+        T.core.invoke('resize_widget', { width: 240, height: height }).catch(function() {});
+      }
 
       document.getElementById('app').addEventListener('mousedown', function(e) {
         if (e.button !== 0) return;
@@ -132,13 +144,16 @@
             reset.className = 'row'; reset.style = 'font-size:9px;color:#666'; reset.textContent = window.reset || '';
             row.appendChild(top); row.appendChild(reset); container.appendChild(row);
           });
-          var desiredHeight = Math.min(420, 205 + (windows.length * 42));
+          var desiredHeight = Math.min(420, 220 + (Math.max(windows.length, 1) * 42));
           document.getElementById('app').style.height = desiredHeight + 'px';
-          win.setSize(new T.window.PhysicalSize(240, desiredHeight)).catch(function() {});
+          var codexStateClass = s.codex_loading ? 'codex-loading' : (s.codex_stale ? 'codex-stale' : (!s.codex_available ? 'codex-unavailable' : ''));
+          codexSection.className = codexStateClass;
+          resizeWidget(desiredHeight);
           document.getElementById('codex-status').textContent = s.codex_loading ? 'Loading…' : (s.codex_diagnostic || (!s.codex_available ? 'Unavailable' : ''));
         } else {
           document.getElementById('app').style.height = '185px';
-          win.setSize(new T.window.PhysicalSize(240, 185)).catch(function() {});
+          codexSection.className = '';
+          resizeWidget(185);
         }
 
         var dot = document.getElementById('ds-dot');
@@ -159,7 +174,7 @@
         }
 
         var a = document.getElementById('app');
-        if (s.stale) { a.classList.add('stale'); } else { a.classList.remove('stale'); }
+        if (s.stale) { a.classList.add('claude-stale'); } else { a.classList.remove('claude-stale'); }
         a.style.opacity = s.stale ? '0.4' : String(s.widget_opacity ?? 0.92);
 
         var diagEl = document.getElementById('diagnostic');

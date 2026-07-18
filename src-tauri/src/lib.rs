@@ -7,7 +7,7 @@ use tauri::{
     image::Image,
     menu::Menu,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder,
+    Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindowBuilder,
 };
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_notification::NotificationExt;
@@ -120,9 +120,12 @@ fn settings_to_config(settings: &SavedSettings) -> poll_cycle::Config {
 }
 
 fn to_json(state: &poll_cycle::DisplayState, app: &tauri::AppHandle) -> serde_json::Value {
+    state_to_json(state, load_settings(app).widget_opacity)
+}
+
+fn state_to_json(state: &poll_cycle::DisplayState, opacity: f64) -> serde_json::Value {
     let claude = &state.claude;
     let codex = &state.codex;
-    let opacity = load_settings(app).widget_opacity;
     serde_json::json!({
         "session_pct": claude.session_used_pct.map(|v| format!("{:.0}%", v)),
         "session_reset": claude.session_reset_time_text,
@@ -179,6 +182,58 @@ fn get_initial_state(app: tauri::AppHandle) -> serde_json::Value {
     let state = app.state::<Mutex<AppState>>();
     let state = state.lock().unwrap();
     to_json(&state.poll_cycle_state, &app)
+}
+
+#[tauri::command]
+fn resize_widget(app: tauri::AppHandle, width: u32, height: u32) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main widget window is unavailable".to_string())?;
+    let position = window.outer_position().map_err(|error| error.to_string())?;
+    let size = window.outer_size().map_err(|error| error.to_string())?;
+    let current = poll_cycle::Rect {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+    };
+    let monitors = app
+        .available_monitors()
+        .map_err(|error| error.to_string())?;
+    let monitor = monitors
+        .iter()
+        .find(|monitor| {
+            let position = monitor.position();
+            let size = monitor.size();
+            poll_cycle::is_position_visible(
+                &current,
+                &[poll_cycle::Rect {
+                    x: position.x,
+                    y: position.y,
+                    width: size.width,
+                    height: size.height,
+                }],
+            )
+        })
+        .or_else(|| monitors.first())
+        .ok_or_else(|| "no display monitor is available".to_string())?;
+    let monitor_position = monitor.position();
+    let monitor_size = monitor.size();
+    let monitor_rect = poll_cycle::Rect {
+        x: monitor_position.x,
+        y: monitor_position.y,
+        width: monitor_size.width,
+        height: monitor_size.height,
+    };
+    let (x, y) =
+        poll_cycle::clamp_window_position(position.x, position.y, width, height, &monitor_rect);
+
+    window
+        .set_size(PhysicalSize::new(width, height))
+        .map_err(|error| error.to_string())?;
+    window
+        .set_position(PhysicalPosition::new(x, y))
+        .map_err(|error| error.to_string())
 }
 
 fn fire_notifications(app: &tauri::AppHandle, events: &[poll_cycle::NotificationEvent]) {
@@ -690,7 +745,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             save_settings,
-            get_initial_state
+            get_initial_state,
+            resize_widget
         ])
         .setup(|app| {
             let icon_image = Image::from_bytes(include_bytes!("../icons/32x32.png"))
@@ -711,7 +767,7 @@ pub fn run() {
 
             TrayIconBuilder::new()
                 .icon(icon_image)
-                .tooltip("Claude / DeepSeek Monitor")
+                .tooltip("Claude / Codex / DeepSeek Monitor")
                 .menu(&menu)
                 .on_tray_icon_event(move |tray, event| {
                     let app = tray.app_handle();
@@ -852,5 +908,42 @@ fn signal_poll_thread_shutdown(app: &tauri::AppHandle) {
     if let Some(control) = guard.as_ref() {
         let _ = control.shutdown_tx.send(());
         let _ = control.done_rx.recv_timeout(Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_serialization_exposes_optional_codex_contract_without_global_stale_state() {
+        let state = poll_cycle::DisplayState {
+            claude: poll_cycle::ClaudeState {
+                stale: false,
+                ..Default::default()
+            },
+            codex: poll_cycle::CodexState {
+                enabled: true,
+                loading: false,
+                available: true,
+                stale: true,
+                diagnostic: Some("Codex rate-limit poll failed.".into()),
+                primary: Some(poll_cycle::CodexWindowState {
+                    label: "5-hour".into(),
+                    used_pct: 42.0,
+                    reset_time_text: Some("later".into()),
+                    pacing: Some(poll_cycle::Pacing::OnPace),
+                }),
+                windows: vec![],
+            },
+            ..Default::default()
+        };
+        let json = state_to_json(&state, 0.92);
+
+        assert_eq!(json["codex_enabled"], true);
+        assert_eq!(json["codex_stale"], true);
+        assert_eq!(json["codex_diagnostic"], "Codex rate-limit poll failed.");
+        assert_eq!(json["codex_primary"]["label"], "5-hour");
+        assert_eq!(json["stale"], false);
     }
 }

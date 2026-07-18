@@ -808,6 +808,27 @@ pub fn is_position_visible(window_rect: &Rect, monitor_rects: &[Rect]) -> bool {
     monitor_rects.iter().any(|m| rects_overlap(window_rect, m))
 }
 
+pub fn clamp_window_position(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    monitor: &Rect,
+) -> (i32, i32) {
+    let max_x = monitor
+        .x
+        .saturating_add(monitor.width as i32)
+        .saturating_sub(width as i32);
+    let max_y = monitor
+        .y
+        .saturating_add(monitor.height as i32)
+        .saturating_sub(height as i32);
+    (
+        x.clamp(monitor.x, max_x.max(monitor.x)),
+        y.clamp(monitor.y, max_y.max(monitor.y)),
+    )
+}
+
 fn rects_overlap(a: &Rect, b: &Rect) -> bool {
     let a_x2 = a.x.saturating_add(a.width as i32);
     let a_y2 = a.y.saturating_add(a.height as i32);
@@ -1925,5 +1946,62 @@ mod tests {
         };
         let monitors: Vec<Rect> = vec![];
         assert!(!is_position_visible(&window, &monitors));
+    }
+
+    #[test]
+    fn test_clamp_window_position_preserves_position_when_it_fits() {
+        assert_eq!(
+            clamp_window_position(
+                100,
+                200,
+                240,
+                185,
+                &Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080
+                }
+            ),
+            (100, 200)
+        );
+    }
+
+    #[test]
+    fn test_clamp_window_position_keeps_expanded_widget_on_screen() {
+        assert_eq!(
+            clamp_window_position(
+                1800,
+                900,
+                240,
+                420,
+                &Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080
+                }
+            ),
+            (1680, 660)
+        );
+    }
+
+    #[test]
+    fn test_clamp_window_position_handles_window_taller_than_monitor() {
+        assert_eq!(
+            clamp_window_position(
+                10,
+                20,
+                240,
+                1200,
+                &Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080
+                }
+            ),
+            (10, 0)
+        );
     }
 }

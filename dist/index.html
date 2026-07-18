@@ -43,6 +43,8 @@
     .stale { }
     .amber { color: #f5a623; }
     .diagnostic { position: absolute; bottom: 2px; left: 8px; right: 8px; font-size: 8px; color: #e55; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: none; }
+    #codex-section { display: none; }
+    .source-diagnostic { font-size: 9px; color: #e55; }
   </style>
 </head>
 <body>
@@ -57,6 +59,14 @@
       <div class="label">Weekly</div>
       <div class="row"><span class="value" id="week-pct">--%</span><span class="pacer" id="week-pacer"></span></div>
       <div class="row" style="font-size:9px;color:#666"><span id="week-reset">--</span></div>
+    </div>
+    <div id="codex-section">
+      <div class="group-header">CODEX</div>
+      <div class="section">
+        <div class="row"><span class="label" id="codex-label">Primary</span><span class="value" id="codex-pct">--%</span><span class="pacer" id="codex-pacer"></span></div>
+        <div class="row" style="font-size:9px;color:#666"><span id="codex-reset"></span></div>
+        <div class="source-diagnostic" id="codex-status"></div>
+      </div>
     </div>
     <div class="group-header">DEEPSEEK</div>
     <div class="ds-status">
@@ -99,6 +109,28 @@
           wp.textContent = labels[s.week_pacing] || s.week_pacing.toUpperCase();
           wp.className = 'pacer ' + s.week_pacing;
         } else { wp.textContent = ''; wp.className = 'pacer'; }
+
+        var codexSection = document.getElementById('codex-section');
+        var codexVisible = !!s.codex_enabled;
+        codexSection.style.display = codexVisible ? 'block' : 'none';
+        if (codexVisible) {
+          var desiredHeight = 245;
+          document.getElementById('app').style.height = desiredHeight + 'px';
+          win.setSize(new T.window.PhysicalSize(240, desiredHeight)).catch(function() {});
+          var primary = s.codex_primary;
+          document.getElementById('codex-label').textContent = primary ? primary.label : 'Primary';
+          document.getElementById('codex-pct').textContent = primary ? primary.used_pct : '--%';
+          document.getElementById('codex-reset').textContent = primary && primary.reset ? primary.reset : '';
+          var cp = document.getElementById('codex-pacer');
+          if (primary && primary.pacing) {
+            cp.textContent = labels[primary.pacing] || primary.pacing.toUpperCase();
+            cp.className = 'pacer ' + primary.pacing;
+          } else { cp.textContent = ''; cp.className = 'pacer'; }
+          document.getElementById('codex-status').textContent = s.codex_loading ? 'Loading…' : (s.codex_diagnostic || (!s.codex_available ? 'Unavailable' : ''));
+        } else {
+          document.getElementById('app').style.height = '185px';
+          win.setSize(new T.window.PhysicalSize(240, 185)).catch(function() {});
+        }
 
         var dot = document.getElementById('ds-dot');
         if (s.deepseek_peak) {

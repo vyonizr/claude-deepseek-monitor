@@ -58,6 +58,50 @@ pub struct ClaudeState {
     pub diagnostic: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodexWindowState {
+    pub label: String,
+    pub used_pct: f64,
+    pub reset_time_text: Option<String>,
+    pub pacing: Option<Pacing>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodexState {
+    pub enabled: bool,
+    pub loading: bool,
+    pub available: bool,
+    pub stale: bool,
+    pub diagnostic: Option<String>,
+    pub primary: Option<CodexWindowState>,
+}
+
+impl Default for CodexState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            loading: false,
+            available: false,
+            stale: false,
+            diagnostic: None,
+            primary: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CodexPollResult {
+    Success {
+        used_pct: f64,
+        reset_at: Option<chrono::DateTime<FixedOffset>>,
+        reset_time_text: Option<String>,
+        window_duration_mins: Option<i64>,
+    },
+    Failure {
+        diagnostic: String,
+    },
+}
+
 impl Default for ClaudeState {
     fn default() -> Self {
         Self {
@@ -77,6 +121,7 @@ impl Default for ClaudeState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DisplayState {
     pub claude: ClaudeState,
+    pub codex: CodexState,
     pub deepseek_status: DeepSeekStatus,
     pub next_transition_info: Option<String>,
 }
@@ -85,6 +130,7 @@ impl Default for DisplayState {
     fn default() -> Self {
         Self {
             claude: ClaudeState::default(),
+            codex: CodexState::default(),
             deepseek_status: DeepSeekStatus::OffPeak,
             next_transition_info: None,
         }
@@ -338,6 +384,8 @@ pub fn poll_cycle(
     current_time: &DateTime<FixedOffset>,
     config: &Config,
     previous_state: &DisplayState,
+    codex_enabled: bool,
+    codex_result: Option<&CodexPollResult>,
 ) -> (DisplayState, Vec<NotificationEvent>) {
     let parsed = raw_usage_text.map(parse_usage_sections);
 
@@ -462,6 +510,14 @@ pub fn poll_cycle(
         display.claude.stale = true;
     }
 
+    display.codex = update_codex_state(
+        codex_enabled,
+        codex_result,
+        current_time,
+        config,
+        &previous_state.codex,
+    );
+
     let (ds_status, ds_info) = compute_deepseek_status(current_time, config);
     display.deepseek_status = ds_status.clone();
     display.next_transition_info = ds_info;
@@ -481,6 +537,86 @@ pub fn poll_cycle(
     }
 
     (display, events)
+}
+
+fn update_codex_state(
+    enabled: bool,
+    result: Option<&CodexPollResult>,
+    current_time: &DateTime<FixedOffset>,
+    config: &Config,
+    previous: &CodexState,
+) -> CodexState {
+    if !enabled {
+        return CodexState::default();
+    }
+
+    let Some(result) = result else {
+        let mut state = previous.clone();
+        state.enabled = true;
+        state.loading = true;
+        return state;
+    };
+
+    match result {
+        CodexPollResult::Failure { diagnostic } => {
+            CodexState {
+                enabled: true,
+                loading: false,
+                available: previous.available,
+                stale: previous.available,
+                diagnostic: Some(diagnostic.clone()),
+                primary: previous.primary.clone(),
+            }
+        }
+        CodexPollResult::Success {
+            used_pct,
+            reset_at,
+            reset_time_text,
+            window_duration_mins,
+        } => {
+            let pacing = match (reset_at, window_duration_mins) {
+                (Some(reset), Some(duration)) if *duration > 0 => {
+                    let start = *reset - Duration::minutes(*duration);
+                    let total = *reset - start;
+                    let elapsed = (*current_time - start).num_seconds() as f64;
+                    let elapsed_pct = (elapsed / total.num_seconds() as f64 * 100.0).clamp(0.0, 100.0);
+                    Some(compute_pacing(
+                        *used_pct,
+                        elapsed_pct,
+                        config.under_pace_threshold,
+                        config.over_pace_threshold,
+                    ))
+                }
+                _ => None,
+            };
+            let label = window_duration_mins.map(codex_duration_label).unwrap_or_else(|| "Codex".into());
+            CodexState {
+                enabled: true,
+                loading: false,
+                available: true,
+                stale: false,
+                diagnostic: None,
+                primary: Some(CodexWindowState {
+                    label,
+                    used_pct: *used_pct,
+                    reset_time_text: reset_time_text.clone(),
+                    pacing,
+                }),
+            }
+        }
+    }
+}
+
+pub fn codex_duration_label(minutes: i64) -> String {
+    if minutes % (24 * 60) == 0 {
+        let days = minutes / (24 * 60);
+        format!("{}-day", days)
+    } else if minutes % 60 == 0 {
+        let hours = minutes / 60;
+        format!("{}-hour", hours)
+    } else {
+        format!("{}-minute", minutes)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -588,7 +724,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (display, _events) = poll_cycle(Some(WEEK_ONLY_USAGE_TEXT), &now, &config, &prev);
+        let (display, _events) = poll_cycle(Some(WEEK_ONLY_USAGE_TEXT), &now, &config, &prev, false, None);
 
         assert!(!display.claude.stale, "awaiting session should not be treated as stale");
         assert_eq!(display.claude.session_used_pct, Some(0.0));
@@ -617,7 +753,7 @@ mod tests {
         // not the clean "no session line at all" case, so it must stay Stale.
         let text = "Current session: used \u{00b7} resets Jul 13, 8:40pm (Asia/Jakarta)\nCurrent week (all models): 13% used \u{00b7} resets Jul 18, 4am (Asia/Jakarta)";
 
-        let (display, _events) = poll_cycle(Some(text), &now, &config, &prev);
+        let (display, _events) = poll_cycle(Some(text), &now, &config, &prev, false, None);
 
         assert!(display.claude.stale, "malformed session line should remain Stale, not Awaiting session");
         assert_eq!(display.claude.session_used_pct, Some(8.0), "previous value carried forward while stale");
@@ -631,7 +767,7 @@ mod tests {
         let config = Config::default();
         let prev = DisplayState::default();
 
-        let (display, _events) = poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev);
+        let (display, _events) = poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev, false, None);
 
         assert!(!display.claude.stale);
         assert_eq!(display.claude.session_used_pct, Some(8.0));
@@ -645,7 +781,7 @@ mod tests {
         let config = Config::default();
         let prev = DisplayState::default();
 
-        let (display, _events) = poll_cycle(None, &now, &config, &prev);
+        let (display, _events) = poll_cycle(None, &now, &config, &prev, false, None);
 
         assert!(display.claude.stale);
         assert_eq!(display.claude.session_used_pct, None);
@@ -666,11 +802,98 @@ mod tests {
             ..Default::default()
         };
 
-        let (display, _events) = poll_cycle(Some("garbage malformed text"), &now, &config, &prev);
+        let (display, _events) = poll_cycle(Some("garbage malformed text"), &now, &config, &prev, false, None);
 
         assert!(display.claude.stale);
         assert_eq!(display.claude.session_used_pct, Some(8.0));
         assert_eq!(display.claude.week_used_pct, Some(13.0));
+    }
+
+    #[test]
+    fn test_codex_disabled_ignores_result_and_is_not_displayed() {
+        let now = make_time(14, 0, 0);
+        let config = Config::default();
+        let result = CodexPollResult::Success {
+            used_pct: 25.0,
+            reset_at: None,
+            reset_time_text: None,
+            window_duration_mins: Some(300),
+        };
+
+        let (display, events) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &now,
+            &config,
+            &DisplayState::default(),
+            false,
+            Some(&result),
+        );
+
+        assert_eq!(display.codex, CodexState::default());
+        assert!(events.is_empty() || events.iter().all(|event| matches!(event, NotificationEvent::DeepSeekPeakStarted { .. })));
+    }
+
+    #[test]
+    fn test_codex_primary_window_is_available_and_paced_without_notifications() {
+        let now = make_time(14, 0, 0);
+        let config = Config::default();
+        let reset_at = chrono::DateTime::parse_from_rfc3339("2026-07-13T15:00:00+07:00").unwrap();
+        let result = CodexPollResult::Success {
+            used_pct: 50.0,
+            reset_at: Some(reset_at),
+            reset_time_text: Some(reset_at.to_rfc3339()),
+            window_duration_mins: Some(300),
+        };
+
+        let (display, events) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &now,
+            &config,
+            &DisplayState::default(),
+            true,
+            Some(&result),
+        );
+
+        let primary = display.codex.primary.as_ref().expect("primary window should be displayed");
+        assert!(display.codex.available);
+        assert!(!display.codex.stale);
+        assert_eq!(primary.label, "5-hour");
+        assert_eq!(primary.used_pct, 50.0);
+        assert_eq!(primary.pacing, Some(Pacing::Underusing));
+        assert!(events.iter().all(|event| matches!(event, NotificationEvent::DeepSeekPeakStarted { .. })));
+    }
+
+    #[test]
+    fn test_codex_first_poll_failure_is_visible_unavailable() {
+        let now = make_time(14, 0, 0);
+        let config = Config::default();
+        let result = CodexPollResult::Failure {
+            diagnostic: "Codex login required: run `codex login`.".into(),
+        };
+
+        let (display, _events) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &now,
+            &config,
+            &DisplayState::default(),
+            true,
+            Some(&result),
+        );
+
+        assert!(display.codex.enabled);
+        assert!(!display.codex.loading);
+        assert!(!display.codex.available);
+        assert!(!display.codex.stale);
+        assert!(display.codex.primary.is_none());
+        assert_eq!(display.codex.diagnostic.as_deref(), Some("Codex login required: run `codex login`."));
+        assert!(!display.claude.stale);
+    }
+
+    #[test]
+    fn test_codex_duration_labels_are_literal() {
+        assert_eq!(codex_duration_label(90), "90-minute");
+        assert_eq!(codex_duration_label(5 * 60), "5-hour");
+        assert_eq!(codex_duration_label(7 * 24 * 60), "7-day");
     }
 
     #[test]
@@ -794,7 +1017,7 @@ mod tests {
         };
         let now = beijing_time(10, 0, 0);
 
-        let (_display, events) = poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev);
+        let (_display, events) = poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev, false, None);
 
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -814,7 +1037,7 @@ mod tests {
         };
         let now = beijing_time(13, 0, 0);
 
-        let (_display, events) = poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev);
+        let (_display, events) = poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev, false, None);
 
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -832,7 +1055,7 @@ mod tests {
         };
         let now = beijing_time(13, 0, 0);
 
-        let (_display, events) = poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev);
+        let (_display, events) = poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev, false, None);
 
         assert_eq!(events.len(), 0);
     }

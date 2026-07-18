@@ -66,6 +66,14 @@
   </div>
 
   <div class="toggle-row">
+    <label>Enable Codex</label>
+    <label class="toggle">
+      <input type="checkbox" id="enable-codex" />
+      <span class="slider"></span>
+    </label>
+  </div>
+
+  <div class="toggle-row">
     <label>Auto-launch at login</label>
     <label class="toggle">
       <input type="checkbox" id="auto-launch" checked />
@@ -88,6 +96,7 @@
 
       function buildSnapshot(data) {
         return {
+          enable_codex: data.enable_codex,
           auto_launch: data.auto_launch,
           poll_interval_minutes: data.poll_interval_minutes,
           under_pace_threshold: data.under_pace_threshold,
@@ -99,6 +108,7 @@
 
       function currentFormState(data) {
         return {
+          enable_codex: document.getElementById('enable-codex').checked,
           auto_launch: document.getElementById('auto-launch').checked,
           poll_interval_minutes: Math.max(1, parseInt(document.getElementById('poll-interval').value) || 1),
           under_pace_threshold: Math.max(1, Math.min(20, parseInt(document.getElementById('under-pace-threshold').value) || 1)),
@@ -112,6 +122,7 @@
         var snap = snapshot || buildSnapshot(data);
         var curr = currentFormState(data);
         var dirty = snap.auto_launch !== curr.auto_launch
+          || snap.enable_codex !== curr.enable_codex
           || snap.poll_interval_minutes !== curr.poll_interval_minutes
           || snap.under_pace_threshold !== curr.under_pace_threshold
           || snap.over_pace_threshold !== curr.over_pace_threshold
@@ -121,6 +132,7 @@
       }
 
       function setupDirtyTracking(data) {
+        document.getElementById('enable-codex').addEventListener('change', function() { updateSaveButton(data); });
         document.getElementById('auto-launch').addEventListener('change', function() { updateSaveButton(data); });
         document.getElementById('poll-interval').addEventListener('input', function() { updateSaveButton(data); });
         document.getElementById('under-pace-threshold').addEventListener('input', function() { updateSaveButton(data); });
@@ -134,6 +146,7 @@
       T.core.invoke('get_settings').then(function(data) {
         settingsData = data;
         renderWindows();
+        document.getElementById('enable-codex').checked = data.enable_codex;
         document.getElementById('auto-launch').checked = data.auto_launch;
         document.getElementById('poll-interval').value = data.poll_interval_minutes;
         document.getElementById('under-pace-threshold').value = data.under_pace_threshold;
@@ -190,6 +203,7 @@
       }
 
       document.getElementById('btn-save').addEventListener('click', function() {
+        settingsData.enable_codex = document.getElementById('enable-codex').checked;
         settingsData.auto_launch = document.getElementById('auto-launch').checked;
         settingsData.poll_interval_minutes = Math.max(1, parseInt(document.getElementById('poll-interval').value) || 1);
         settingsData.under_pace_threshold = Math.max(1, Math.min(20, parseInt(document.getElementById('under-pace-threshold').value) || 1));

@@ -1,20 +1,21 @@
 pub mod poll_cycle;
 
+use std::io::{BufRead, Write};
 use std::sync::Mutex;
 use std::time::Duration;
-use std::io::{BufRead, Write};
 use tauri::{
     image::Image,
     menu::Menu,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder,
 };
-use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_notification::NotificationExt;
 
 pub struct AppState {
     pub poll_cycle_state: poll_cycle::DisplayState,
     pub consecutive_failures: u32,
+    pub settings_generation: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -59,8 +60,14 @@ impl Default for SavedSettings {
     fn default() -> Self {
         Self {
             deepseek_windows: vec![
-                WindowConfig { start_hour: 9, end_hour: 12 },
-                WindowConfig { start_hour: 14, end_hour: 18 },
+                WindowConfig {
+                    start_hour: 9,
+                    end_hour: 12,
+                },
+                WindowConfig {
+                    start_hour: 14,
+                    end_hour: 18,
+                },
             ],
             auto_launch: true,
             poll_interval_minutes: default_poll_interval_minutes(),
@@ -99,12 +106,14 @@ fn save_settings_to_disk(app: &tauri::AppHandle, settings: &SavedSettings) {
 
 fn settings_to_config(settings: &SavedSettings) -> poll_cycle::Config {
     poll_cycle::Config {
-        deepseek_windows: settings.deepseek_windows.iter().map(|w| {
-            poll_cycle::DeepSeekWindow {
+        deepseek_windows: settings
+            .deepseek_windows
+            .iter()
+            .map(|w| poll_cycle::DeepSeekWindow {
                 start_hour: w.start_hour,
                 end_hour: w.end_hour,
-            }
-        }).collect(),
+            })
+            .collect(),
         under_pace_threshold: settings.under_pace_threshold as f64,
         over_pace_threshold: settings.over_pace_threshold as f64,
     }
@@ -172,21 +181,23 @@ fn get_initial_state(app: tauri::AppHandle) -> serde_json::Value {
     to_json(&state.poll_cycle_state, &app)
 }
 
-fn fire_notifications(
-    app: &tauri::AppHandle,
-    events: &[poll_cycle::NotificationEvent],
-) {
+fn fire_notifications(app: &tauri::AppHandle, events: &[poll_cycle::NotificationEvent]) {
     for event in events {
         match event {
             poll_cycle::NotificationEvent::DeepSeekPeakStarted { window_label } => {
-                let _ = app.notification()
+                let _ = app
+                    .notification()
                     .builder()
                     .title("DeepSeek Peak Pricing Started")
-                    .body(format!("2× pricing window {} is now active. Requests will cost double.", window_label))
+                    .body(format!(
+                        "2× pricing window {} is now active. Requests will cost double.",
+                        window_label
+                    ))
                     .show();
             }
             poll_cycle::NotificationEvent::DeepSeekPeakEnded => {
-                let _ = app.notification()
+                let _ = app
+                    .notification()
                     .builder()
                     .title("DeepSeek Peak Pricing Ended")
                     .body("Standard pricing has resumed. Requests are back to normal rates.")
@@ -232,14 +243,15 @@ fn run_claude_command() -> Result<String, String> {
             .args(["--print", "/usage"])
             .output()
         {
-            Ok(out) if out.status.success() => {
-                String::from_utf8(out.stdout)
-                    .map(|s| s.trim().to_string())
-                    .map_err(|e| format!("claude output is not UTF-8: {e}"))
-            }
+            Ok(out) if out.status.success() => String::from_utf8(out.stdout)
+                .map(|s| s.trim().to_string())
+                .map_err(|e| format!("claude output is not UTF-8: {e}")),
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                Err(format!("claude exited with code {:?}: {stderr}", out.status.code()))
+                Err(format!(
+                    "claude exited with code {:?}: {stderr}",
+                    out.status.code()
+                ))
             }
             Err(e) => Err(format!("claude: {e}")),
         }
@@ -255,17 +267,44 @@ fn codex_failure(message: impl Into<String>) -> poll_cycle::CodexPollResult {
 }
 
 fn classify_codex_error(message: &str) -> poll_cycle::CodexPollResult {
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("login") || lower.contains("auth") {
-        codex_failure("Codex login required: run `codex login`.")
-    } else if lower.contains("method not found") || lower.contains("unknown method") {
-        codex_failure("Codex CLI update required for rate-limit monitoring.")
-    } else {
-        codex_failure("Codex rate-limit poll failed.")
+    codex_failure(poll_cycle::codex_failure_diagnostic(message))
+}
+
+fn receive_codex_response(
+    line_rx: &std::sync::mpsc::Receiver<String>,
+    expected_id: u64,
+    deadline: std::time::Instant,
+) -> Result<serde_json::Value, poll_cycle::CodexPollResult> {
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(codex_failure("Codex rate-limit request timed out."));
+        }
+        match line_rx.recv_timeout(remaining) {
+            Ok(line) => match serde_json::from_str::<serde_json::Value>(&line) {
+                Ok(value) if value.get("id") == Some(&serde_json::json!(expected_id)) => {
+                    if value.get("error").is_some() {
+                        let message = value["error"]["message"].as_str().unwrap_or_default();
+                        return Err(classify_codex_error(message));
+                    }
+                    return Ok(value);
+                }
+                Ok(_) | Err(_) => {}
+            },
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(codex_failure("Codex rate-limit request timed out."));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(codex_failure(
+                    "Codex app-server closed before returning rate limits.",
+                ));
+            }
+        }
     }
 }
 
 fn run_codex_command() -> poll_cycle::CodexPollResult {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let candidates = if cfg!(target_os = "windows") {
         vec!["codex.cmd", "codex"]
     } else {
@@ -328,8 +367,25 @@ fn run_codex_command() -> poll_cycle::CodexPollResult {
         let write_request = |request: &serde_json::Value, stdin: &mut std::process::ChildStdin| {
             writeln!(stdin, "{}", request).and_then(|_| stdin.flush())
         };
-        if write_request(&initialize, &mut stdin)
-            .and_then(|_| write_request(&initialized, &mut stdin))
+        if write_request(&initialize, &mut stdin).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return codex_failure("Codex app-server request failed.");
+        }
+        let initialize_response = match receive_codex_response(&line_rx, 1, deadline) {
+            Ok(response) => response,
+            Err(failure) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return failure;
+            }
+        };
+        if !poll_cycle::has_codex_protocol_capabilities(&initialize_response) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return codex_failure("Codex protocol capability response is incompatible.");
+        }
+        if write_request(&initialized, &mut stdin)
             .and_then(|_| write_request(&read_limits, &mut stdin))
             .is_err()
         {
@@ -339,36 +395,12 @@ fn run_codex_command() -> poll_cycle::CodexPollResult {
         }
         drop(stdin);
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let response = loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
+        let response = match receive_codex_response(&line_rx, 2, deadline) {
+            Ok(response) => response,
+            Err(failure) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return codex_failure("Codex rate-limit request timed out.");
-            }
-            match line_rx.recv_timeout(remaining) {
-                Ok(line) => match serde_json::from_str::<serde_json::Value>(&line) {
-                    Ok(value) if value.get("id") == Some(&serde_json::json!(2)) => break value,
-                    Ok(value) if value.get("error").is_some() => {
-                        let message = value["error"]["message"].as_str().unwrap_or_default();
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return classify_codex_error(message);
-                    }
-                    Ok(_) => {}
-                    Err(_) => {}
-                },
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return codex_failure("Codex rate-limit request timed out.");
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return codex_failure("Codex app-server closed before returning rate limits.");
-                }
+                return failure;
             }
         };
         let _ = child.kill();
@@ -395,17 +427,21 @@ fn run_poll_cycle(app: &tauri::AppHandle) -> bool {
     let codex_enabled = load_settings(app).enable_codex;
 
     let state_container = app.state::<Mutex<AppState>>();
-    let mut state_lock = state_container.lock().unwrap();
-
-    if codex_enabled && !state_lock.poll_cycle_state.codex.enabled {
-        state_lock.poll_cycle_state.codex = poll_cycle::CodexState {
-            enabled: true,
-            loading: true,
-            ..Default::default()
-        };
-        let loading_state = state_lock.poll_cycle_state.clone();
-        emit_state_update(app, &loading_state);
-    }
+    let previous_state = {
+        let mut state_lock = state_container.lock().unwrap();
+        let settings_generation = state_lock.settings_generation;
+        if codex_enabled && !state_lock.poll_cycle_state.codex.enabled {
+            state_lock.poll_cycle_state.codex = poll_cycle::CodexState {
+                enabled: true,
+                loading: true,
+                ..Default::default()
+            };
+            let loading_state = state_lock.poll_cycle_state.clone();
+            emit_state_update(app, &loading_state);
+        }
+        (state_lock.poll_cycle_state.clone(), settings_generation)
+    };
+    let (previous_state, settings_generation) = previous_state;
 
     // The claude CLI occasionally returns a malformed/incomplete response on its
     // first invocation right after the app cold-starts (auth/session warmup),
@@ -414,6 +450,14 @@ fn run_poll_cycle(app: &tauri::AppHandle) -> bool {
     const MAX_ATTEMPTS: u32 = 2;
     let mut attempt = 1;
     let (mut new_state, events, raw_text, cmd_diagnostic) = loop {
+        // Codex is optional and must not hold up Claude's subprocess. Its own
+        // worker has a ten-second deadline; Claude and Codex share this poll
+        // cycle without sharing failure/backoff state.
+        let codex_thread = if codex_enabled {
+            Some(std::thread::spawn(run_codex_command))
+        } else {
+            None
+        };
         let (raw_text, cmd_diagnostic) = match run_claude_command() {
             Ok(text) => {
                 eprintln!("[monitor] claude OK, {} bytes received", text.len());
@@ -426,22 +470,33 @@ fn run_poll_cycle(app: &tauri::AppHandle) -> bool {
         };
 
         eprintln!("[monitor] running poll_cycle() (attempt {attempt})");
-        let codex_result = if codex_enabled {
-            Some(run_codex_command())
-        } else {
-            None
+        let codex_result = match codex_thread {
+            Some(thread) => Some(
+                thread
+                    .join()
+                    .unwrap_or_else(|_| codex_failure("Codex poll worker failed.")),
+            ),
+            None => None,
         };
+        // A setting save may disable Codex while the worker is in flight. Do
+        // not apply a late result or retain a stale Codex section in that case.
+        let codex_enabled_now = load_settings(app).enable_codex;
         let (new_state, events) = poll_cycle::poll_cycle(
             raw_text.as_deref(),
             &current_time,
             &config,
-            &state_lock.poll_cycle_state,
-            codex_enabled,
+            &previous_state,
+            codex_enabled_now,
             codex_result.as_ref(),
         );
 
-        eprintln!("[monitor] poll_cycle done, events={}, stale={}, session_pct={:?}, week_pct={:?}",
-            events.len(), new_state.claude.stale, new_state.claude.session_used_pct, new_state.claude.week_used_pct);
+        eprintln!(
+            "[monitor] poll_cycle done, events={}, stale={}, session_pct={:?}, week_pct={:?}",
+            events.len(),
+            new_state.claude.stale,
+            new_state.claude.session_used_pct,
+            new_state.claude.week_used_pct
+        );
 
         let parse_failed = raw_text.is_some()
             && new_state.claude.stale
@@ -470,16 +525,20 @@ fn run_poll_cycle(app: &tauri::AppHandle) -> bool {
     }
 
     let succeeded = new_state.claude.diagnostic.is_none();
-    state_lock.consecutive_failures = if succeeded {
-        0
-    } else {
-        state_lock.consecutive_failures + 1
-    };
-
     let display_state = new_state.clone();
-    state_lock.poll_cycle_state = new_state;
-    drop(state_lock);
-    drop(state_container);
+    {
+        let mut state_lock = state_container.lock().unwrap();
+        if state_lock.settings_generation != settings_generation {
+            eprintln!("[monitor] settings changed during poll; discarding late cycle");
+            return state_lock.poll_cycle_state.claude.diagnostic.is_none();
+        }
+        state_lock.consecutive_failures = if succeeded {
+            0
+        } else {
+            state_lock.consecutive_failures + 1
+        };
+        state_lock.poll_cycle_state = new_state;
+    }
 
     eprintln!("[monitor] firing notifications and emitting state");
     fire_notifications(app, &events);
@@ -513,35 +572,51 @@ fn get_settings(app: tauri::AppHandle) -> serde_json::Value {
 
 #[tauri::command]
 fn save_settings(app: tauri::AppHandle, settings: serde_json::Value) -> Result<(), String> {
-    let auto_launch = settings.get("auto_launch").and_then(|v| v.as_bool()).unwrap_or(true);
-    let windows = settings.get("deepseek_windows").and_then(|v| v.as_array()).map(|arr| {
-        arr.iter().filter_map(|w| {
-            Some(WindowConfig {
-                start_hour: w.get("start_hour")?.as_u64()? as u8,
-                end_hour: w.get("end_hour")?.as_u64()? as u8,
-            })
-        }).collect::<Vec<_>>()
-    }).unwrap_or_default();
-    let poll_interval_minutes = settings.get("poll_interval_minutes")
+    let auto_launch = settings
+        .get("auto_launch")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let windows = settings
+        .get("deepseek_windows")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|w| {
+                    Some(WindowConfig {
+                        start_hour: w.get("start_hour")?.as_u64()? as u8,
+                        end_hour: w.get("end_hour")?.as_u64()? as u8,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let poll_interval_minutes = settings
+        .get("poll_interval_minutes")
         .and_then(|v| v.as_u64())
         .map(|v| (v as u32).max(1))
         .unwrap_or_else(default_poll_interval_minutes);
 
-    let under_pace_threshold = settings.get("under_pace_threshold")
+    let under_pace_threshold = settings
+        .get("under_pace_threshold")
         .and_then(|v| v.as_u64())
         .map(|v| (v as u32).clamp(1, 20))
         .unwrap_or_else(default_under_pace_threshold);
 
-    let over_pace_threshold = settings.get("over_pace_threshold")
+    let over_pace_threshold = settings
+        .get("over_pace_threshold")
         .and_then(|v| v.as_u64())
         .map(|v| (v as u32).clamp(1, 20))
         .unwrap_or_else(default_over_pace_threshold);
 
-    let widget_opacity = settings.get("widget_opacity")
+    let widget_opacity = settings
+        .get("widget_opacity")
         .and_then(|v| v.as_f64())
         .map(|v| v.clamp(0.3, 1.0))
         .unwrap_or_else(default_widget_opacity);
-    let enable_codex = settings.get("enable_codex").and_then(|v| v.as_bool()).unwrap_or(false);
+    let enable_codex = settings
+        .get("enable_codex")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let saved = SavedSettings {
         deepseek_windows: windows,
@@ -553,11 +628,26 @@ fn save_settings(app: tauri::AppHandle, settings: serde_json::Value) -> Result<(
         enable_codex,
     };
 
+    {
+        let state = app.state::<Mutex<AppState>>();
+        let mut state = state.lock().unwrap();
+        state.settings_generation = state.settings_generation.saturating_add(1);
+    }
+
     save_settings_to_disk(&app, &saved);
 
     {
         let state = app.state::<Mutex<AppState>>();
-        let current = state.lock().unwrap().poll_cycle_state.clone();
+        let current = {
+            let mut state = state.lock().unwrap();
+            if !enable_codex {
+                // Clear the visible source before emitting the save result.
+                // The generation increment above also makes an in-flight
+                // Codex worker's result ineligible for state publication.
+                state.poll_cycle_state.codex = poll_cycle::CodexState::default();
+            }
+            state.poll_cycle_state.clone()
+        };
         emit_state_update(&app, &current);
     }
 
@@ -585,24 +675,30 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![]),
         ))
-        .plugin(tauri_plugin_window_state::Builder::default()
-            .with_state_flags(tauri_plugin_window_state::StateFlags::POSITION)
-            .with_denylist(&["settings"])
-            .build())
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(tauri_plugin_window_state::StateFlags::POSITION)
+                .with_denylist(&["settings"])
+                .build(),
+        )
         .manage(Mutex::new(AppState {
             poll_cycle_state: poll_cycle::DisplayState::default(),
             consecutive_failures: 0,
+            settings_generation: 0,
         }))
         .manage(Mutex::new(None::<PollThreadControl>))
-        .invoke_handler(tauri::generate_handler![get_settings, save_settings, get_initial_state])
+        .invoke_handler(tauri::generate_handler![
+            get_settings,
+            save_settings,
+            get_initial_state
+        ])
         .setup(|app| {
             let icon_image = Image::from_bytes(include_bytes!("../icons/32x32.png"))
                 .expect("failed to decode tray icon");
 
             let settings_item =
                 tauri::menu::MenuItemBuilder::with_id("settings", "Settings").build(app)?;
-            let quit_item =
-                tauri::menu::MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+            let quit_item = tauri::menu::MenuItemBuilder::with_id("quit", "Quit").build(app)?;
             let menu = Menu::with_items(app, &[&settings_item, &quit_item])?;
 
             // Apply autostart from saved settings
@@ -664,16 +760,19 @@ pub fn run() {
                         width: size.width,
                         height: size.height,
                     };
-                    let monitor_rects: Vec<poll_cycle::Rect> = monitors.iter().map(|m| {
-                        let mpos = m.position();
-                        let msize = m.size();
-                        poll_cycle::Rect {
-                            x: mpos.x,
-                            y: mpos.y,
-                            width: msize.width,
-                            height: msize.height,
-                        }
-                    }).collect();
+                    let monitor_rects: Vec<poll_cycle::Rect> = monitors
+                        .iter()
+                        .map(|m| {
+                            let mpos = m.position();
+                            let msize = m.size();
+                            poll_cycle::Rect {
+                                x: mpos.x,
+                                y: mpos.y,
+                                width: msize.width,
+                                height: msize.height,
+                            }
+                        })
+                        .collect();
                     if !poll_cycle::is_position_visible(&window_rect, &monitor_rects) {
                         if let Some(primary) = app.primary_monitor().unwrap_or(None) {
                             let ppos = primary.position();
@@ -700,7 +799,10 @@ pub fn run() {
             let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
             *app.state::<Mutex<Option<PollThreadControl>>>()
                 .lock()
-                .unwrap() = Some(PollThreadControl { shutdown_tx, done_rx });
+                .unwrap() = Some(PollThreadControl {
+                shutdown_tx,
+                done_rx,
+            });
 
             let handle = app.handle().clone();
             std::thread::spawn(move || {

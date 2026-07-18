@@ -1,7 +1,7 @@
 pub mod poll_cycle;
 
-use std::io::{BufRead, Write};
-use std::sync::Mutex;
+use std::io::{BufRead, Read, Write};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{
     image::Image,
@@ -332,6 +332,67 @@ fn classify_codex_error(message: &str) -> poll_cycle::CodexPollResult {
     codex_failure(poll_cycle::codex_failure_diagnostic(message))
 }
 
+const CODEX_EARLY_CLOSE: &str = "Codex app-server closed before returning rate limits.";
+const CODEX_STDERR_LIMIT: usize = 4096;
+
+#[derive(Clone, Default)]
+struct BoundedStderr {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl BoundedStderr {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes.lock().unwrap()).into_owned()
+    }
+}
+
+fn codex_exit_diagnostic(status: Option<std::process::ExitStatus>, stderr: &str) -> String {
+    let context = format!("{:?} {}", status.map(|s| s.code()), stderr).to_ascii_lowercase();
+    if context.contains("login") || context.contains("auth") || context.contains("unauthorized") {
+        "Codex login required: run `codex login`.".into()
+    } else if context.contains("method not found")
+        || context.contains("unknown method")
+        || context.contains("unsupported")
+        || context.contains("protocol")
+        || context.contains("version")
+    {
+        "Codex CLI update required for rate-limit monitoring.".into()
+    } else {
+        let code = status
+            .and_then(|status| status.code())
+            .map(|code| format!(" (exit code {code})"))
+            .unwrap_or_default();
+        format!("Codex app-server exited before returning rate limits{code}.")
+    }
+}
+
+fn finish_codex_child(
+    child: &mut std::process::Child,
+    stderr: &BoundedStderr,
+    stderr_thread: Option<std::thread::JoinHandle<()>>,
+) -> Option<std::process::ExitStatus> {
+    let status = match child.try_wait() {
+        Ok(Some(status)) => Some(status),
+        Ok(None) => {
+            let _ = child.kill();
+            child.wait().ok()
+        }
+        Err(_) => child.wait().ok(),
+    };
+    if let Some(thread) = stderr_thread {
+        let _ = thread.join();
+    }
+    // Keep this diagnostic bounded even when it is written to the process log.
+    let stderr_text = stderr.text();
+    if !stderr_text.is_empty() {
+        eprintln!(
+            "[monitor] codex app-server stderr ({} bytes captured)",
+            stderr_text.len()
+        );
+    }
+    status
+}
+
 fn receive_codex_response(
     line_rx: &std::sync::mpsc::Receiver<String>,
     expected_id: u64,
@@ -357,9 +418,7 @@ fn receive_codex_response(
                 return Err(codex_failure("Codex rate-limit request timed out."));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(codex_failure(
-                    "Codex app-server closed before returning rate limits.",
-                ));
+                return Err(codex_failure(CODEX_EARLY_CLOSE));
             }
         }
     }
@@ -380,7 +439,7 @@ fn run_codex_command() -> poll_cycle::CodexPollResult {
             .args(["app-server"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::piped());
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
@@ -398,6 +457,22 @@ fn run_codex_command() -> poll_cycle::CodexPollResult {
         };
         let mut stdin = child.stdin.take().expect("Codex stdin was piped");
         let stdout = child.stdout.take().expect("Codex stdout was piped");
+        let stderr = child.stderr.take().expect("Codex stderr was piped");
+        let bounded_stderr = BoundedStderr::default();
+        let stderr_capture = bounded_stderr.clone();
+        let stderr_thread = std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stderr);
+            let mut chunk = [0u8; 512];
+            loop {
+                let count = match reader.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => count,
+                };
+                let mut bytes = stderr_capture.bytes.lock().unwrap();
+                let remaining = CODEX_STDERR_LIMIT.saturating_sub(bytes.len());
+                bytes.extend_from_slice(&chunk[..count.min(remaining)]);
+            }
+        });
         let (line_tx, line_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for line in std::io::BufReader::new(stdout).lines().flatten() {
@@ -430,43 +505,47 @@ fn run_codex_command() -> poll_cycle::CodexPollResult {
             writeln!(stdin, "{}", request).and_then(|_| stdin.flush())
         };
         if write_request(&initialize, &mut stdin).is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = finish_codex_child(&mut child, &bounded_stderr, Some(stderr_thread));
             return codex_failure("Codex app-server request failed.");
         }
         let initialize_response = match receive_codex_response(&line_rx, 1, deadline) {
             Ok(response) => response,
             Err(failure) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return failure;
+                let status = finish_codex_child(&mut child, &bounded_stderr, Some(stderr_thread));
+                return if matches!(&failure, poll_cycle::CodexPollResult::Failure { diagnostic } if diagnostic == CODEX_EARLY_CLOSE)
+                {
+                    codex_failure(codex_exit_diagnostic(status, &bounded_stderr.text()))
+                } else {
+                    failure
+                };
             }
         };
         if !poll_cycle::has_codex_initialize_result(&initialize_response) {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = finish_codex_child(&mut child, &bounded_stderr, Some(stderr_thread));
             return codex_failure("Codex protocol capability response is incompatible.");
         }
         if write_request(&initialized, &mut stdin)
             .and_then(|_| write_request(&read_limits, &mut stdin))
             .is_err()
         {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = finish_codex_child(&mut child, &bounded_stderr, Some(stderr_thread));
             return codex_failure("Codex app-server request failed.");
         }
-        drop(stdin);
 
         let response = match receive_codex_response(&line_rx, 2, deadline) {
             Ok(response) => response,
             Err(failure) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return failure;
+                let status = finish_codex_child(&mut child, &bounded_stderr, Some(stderr_thread));
+                return if matches!(&failure, poll_cycle::CodexPollResult::Failure { diagnostic } if diagnostic == CODEX_EARLY_CLOSE)
+                {
+                    codex_failure(codex_exit_diagnostic(status, &bounded_stderr.text()))
+                } else {
+                    failure
+                };
             }
         };
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(stdin);
+        let _ = finish_codex_child(&mut child, &bounded_stderr, Some(stderr_thread));
         return match poll_cycle::parse_codex_response(&response) {
             Ok(result) => result,
             Err(message) => classify_codex_error(&message),
@@ -921,6 +1000,7 @@ fn signal_poll_thread_shutdown(app: &tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
 
     #[test]
     fn state_serialization_exposes_optional_codex_contract_without_global_stale_state() {
@@ -952,5 +1032,57 @@ mod tests {
         assert_eq!(json["codex_diagnostic"], "Codex rate-limit poll failed.");
         assert_eq!(json["codex_primary"]["label"], "5-hour");
         assert_eq!(json["stale"], false);
+    }
+
+    #[test]
+    fn codex_current_transcript_ignores_notifications_before_matching_response() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(r#"{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"codex"}}}"#.into())
+            .unwrap();
+        let initialize =
+            receive_codex_response(&rx, 1, std::time::Instant::now() + Duration::from_secs(1))
+                .unwrap();
+        assert!(poll_cycle::has_codex_initialize_result(&initialize));
+        tx.send(r#"{"jsonrpc":"2.0","method":"account/updated","params":{}}"#.into())
+            .unwrap();
+        tx.send(r#"{"jsonrpc":"2.0","id":2,"result":{"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":25.0,"windowDurationMins":300}}}}}"#.into())
+            .unwrap();
+        let response =
+            receive_codex_response(&rx, 2, std::time::Instant::now() + Duration::from_secs(1))
+                .unwrap();
+        assert!(matches!(
+            poll_cycle::parse_codex_response(&response),
+            Ok(poll_cycle::CodexPollResult::Success { .. })
+        ));
+    }
+
+    #[test]
+    fn codex_error_response_keeps_authentication_diagnostic() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"authentication required"}}"#.into())
+            .unwrap();
+        let result =
+            receive_codex_response(&rx, 2, std::time::Instant::now() + Duration::from_secs(1));
+        assert!(
+            matches!(result, Err(poll_cycle::CodexPollResult::Failure { diagnostic }) if diagnostic.contains("login"))
+        );
+    }
+
+    #[test]
+    fn codex_timeout_is_distinct_from_early_exit() {
+        let (_tx, rx) = mpsc::channel::<String>();
+        let result = receive_codex_response(&rx, 2, std::time::Instant::now());
+        assert!(
+            matches!(result, Err(poll_cycle::CodexPollResult::Failure { diagnostic }) if diagnostic.contains("timed out"))
+        );
+        assert!(codex_exit_diagnostic(None, "unexpected shutdown").contains("exited before"));
+    }
+
+    #[test]
+    fn codex_early_exit_classifies_bounded_stderr_without_exposing_it() {
+        let diagnostic =
+            codex_exit_diagnostic(None, "fatal: authentication required; token=secret");
+        assert_eq!(diagnostic, "Codex login required: run `codex login`.");
+        assert!(!diagnostic.contains("secret"));
     }
 }

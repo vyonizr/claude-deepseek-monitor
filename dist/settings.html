@@ -9,7 +9,7 @@
     body { 
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
       font-size: 12px; padding: 16px; color: #d0d0d0;
-      background: #222; width: 320px; height: 320px;
+      background: #222; width: 320px; height: 360px;
     }
     h2 { font-size: 13px; margin-bottom: 12px; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; }
     .field { margin-bottom: 10px; }
@@ -66,6 +66,14 @@
   </div>
 
   <div class="toggle-row">
+    <label>Enable Claude</label>
+    <label class="toggle">
+      <input type="checkbox" id="enable-claude" checked />
+      <span class="slider"></span>
+    </label>
+  </div>
+
+  <div class="toggle-row">
     <label>Enable Codex</label>
     <label class="toggle">
       <input type="checkbox" id="enable-codex" />
@@ -96,6 +104,7 @@
 
       function buildSnapshot(data) {
         return {
+          enable_claude: data.enable_claude,
           enable_codex: data.enable_codex,
           auto_launch: data.auto_launch,
           poll_interval_minutes: data.poll_interval_minutes,
@@ -108,6 +117,7 @@
 
       function currentFormState(data) {
         return {
+          enable_claude: document.getElementById('enable-claude').checked,
           enable_codex: document.getElementById('enable-codex').checked,
           auto_launch: document.getElementById('auto-launch').checked,
           poll_interval_minutes: Math.max(1, parseInt(document.getElementById('poll-interval').value) || 1),
@@ -122,6 +132,7 @@
         var snap = snapshot || buildSnapshot(data);
         var curr = currentFormState(data);
         var dirty = snap.auto_launch !== curr.auto_launch
+          || snap.enable_claude !== curr.enable_claude
           || snap.enable_codex !== curr.enable_codex
           || snap.poll_interval_minutes !== curr.poll_interval_minutes
           || snap.under_pace_threshold !== curr.under_pace_threshold
@@ -132,6 +143,7 @@
       }
 
       function setupDirtyTracking(data) {
+        document.getElementById('enable-claude').addEventListener('change', function() { updateSaveButton(data); });
         document.getElementById('enable-codex').addEventListener('change', function() { updateSaveButton(data); });
         document.getElementById('auto-launch').addEventListener('change', function() { updateSaveButton(data); });
         document.getElementById('poll-interval').addEventListener('input', function() { updateSaveButton(data); });
@@ -146,6 +158,7 @@
       T.core.invoke('get_settings').then(function(data) {
         settingsData = data;
         renderWindows();
+        document.getElementById('enable-claude').checked = data.enable_claude;
         document.getElementById('enable-codex').checked = data.enable_codex;
         document.getElementById('auto-launch').checked = data.auto_launch;
         document.getElementById('poll-interval').value = data.poll_interval_minutes;
@@ -203,6 +216,7 @@
       }
 
       document.getElementById('btn-save').addEventListener('click', function() {
+        settingsData.enable_claude = document.getElementById('enable-claude').checked;
         settingsData.enable_codex = document.getElementById('enable-codex').checked;
         settingsData.auto_launch = document.getElementById('auto-launch').checked;
         settingsData.poll_interval_minutes = Math.max(1, parseInt(document.getElementById('poll-interval').value) || 1);

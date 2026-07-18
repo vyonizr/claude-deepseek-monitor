@@ -53,6 +53,7 @@ impl Default for Config {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClaudeState {
+    pub enabled: bool,
     pub session_used_pct: Option<f64>,
     pub session_reset_time_text: Option<String>,
     pub session_pacing: Option<Pacing>,
@@ -223,6 +224,7 @@ pub fn parse_codex_response(response: &serde_json::Value) -> Result<CodexPollRes
 impl Default for ClaudeState {
     fn default() -> Self {
         Self {
+            enabled: true,
             session_used_pct: None,
             session_reset_time_text: None,
             session_pacing: None,
@@ -516,159 +518,173 @@ pub fn poll_cycle(
     current_time: &DateTime<FixedOffset>,
     config: &Config,
     previous_state: &DisplayState,
+    claude_enabled: bool,
     codex_enabled: bool,
     codex_result: Option<&CodexPollResult>,
 ) -> (DisplayState, Vec<NotificationEvent>) {
-    let parsed = raw_usage_text.map(parse_usage_sections);
+    let (mut display, usage_ok) = if !claude_enabled {
+        let mut display = previous_state.clone();
+        display.claude = ClaudeState {
+            enabled: false,
+            ..Default::default()
+        };
+        (display, false)
+    } else {
+        let parsed = raw_usage_text.map(parse_usage_sections);
 
-    let awaiting_session = matches!(
-        &parsed,
-        Some(p) if p.week.is_some() && p.session.is_none() && !p.session_line_present
-    );
+        let awaiting_session = matches!(
+            &parsed,
+            Some(p) if p.week.is_some() && p.session.is_none() && !p.session_line_present
+        );
 
-    let full = parsed.as_ref().and_then(|p| match (&p.session, &p.week) {
-        (Some((sp, sr)), Some((wp, wr))) => Some((*sp, sr.clone(), *wp, wr.clone())),
-        _ => None,
-    });
+        let full = parsed.as_ref().and_then(|p| match (&p.session, &p.week) {
+            (Some((sp, sr)), Some((wp, wr))) => Some((*sp, sr.clone(), *wp, wr.clone())),
+            _ => None,
+        });
 
-    let (mut display, usage_ok) = if let Some((sp, sr, wp, wr)) = full {
-        let local_offset = *current_time.offset();
-        let current_year = current_time.year();
-        let session_reset_dt = parse_reset_datetime(&sr, local_offset, current_year);
-        let week_reset_dt = parse_reset_datetime(&wr, local_offset, current_year);
+        if let Some((sp, sr, wp, wr)) = full {
+            let local_offset = *current_time.offset();
+            let current_year = current_time.year();
+            let session_reset_dt = parse_reset_datetime(&sr, local_offset, current_year);
+            let week_reset_dt = parse_reset_datetime(&wr, local_offset, current_year);
 
-        let session_start_str =
-            if previous_state.claude.session_reset_time_text.as_deref() != Some(&sr) {
-                session_reset_dt.map(|dt| (dt - Duration::hours(SESSION_WINDOW_HOURS)).to_rfc3339())
-            } else {
-                previous_state.claude.session_window_start.clone()
+            let session_start_str =
+                if previous_state.claude.session_reset_time_text.as_deref() != Some(&sr) {
+                    session_reset_dt.map(|dt| (dt - Duration::hours(SESSION_WINDOW_HOURS)).to_rfc3339())
+                } else {
+                    previous_state.claude.session_window_start.clone()
+                };
+
+            let session_window_start = session_start_str
+                .as_ref()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok());
+
+            let session_pacing = match (session_window_start, session_reset_dt) {
+                (Some(start), Some(reset)) if start < reset => {
+                    let total_dur = reset - start;
+                    let elapsed = *current_time - start;
+                    if total_dur.num_seconds() > 0 {
+                        let elapsed_pct =
+                            (elapsed.num_seconds() as f64 / total_dur.num_seconds() as f64) * 100.0;
+                        let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
+                        Some(compute_pacing(
+                            sp,
+                            elapsed_pct,
+                            config.under_pace_threshold,
+                            config.over_pace_threshold,
+                        ))
+                    } else {
+                        previous_state.claude.session_pacing.clone()
+                    }
+                }
+                _ => previous_state.claude.session_pacing.clone(),
             };
 
-        let session_window_start = session_start_str
-            .as_ref()
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok());
-
-        let session_pacing = match (session_window_start, session_reset_dt) {
-            (Some(start), Some(reset)) if start < reset => {
-                let total_dur = reset - start;
-                let elapsed = *current_time - start;
-                if total_dur.num_seconds() > 0 {
-                    let elapsed_pct =
-                        (elapsed.num_seconds() as f64 / total_dur.num_seconds() as f64) * 100.0;
-                    let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
-                    Some(compute_pacing(
-                        sp,
-                        elapsed_pct,
-                        config.under_pace_threshold,
-                        config.over_pace_threshold,
-                    ))
-                } else {
-                    previous_state.claude.session_pacing.clone()
+            let week_pacing = match week_reset_dt {
+                Some(reset) => {
+                    let window_start = reset - Duration::days(7);
+                    let total_dur = reset - window_start;
+                    let elapsed = *current_time - window_start;
+                    if total_dur.num_seconds() > 0 {
+                        let elapsed_pct =
+                            (elapsed.num_seconds() as f64 / total_dur.num_seconds() as f64) * 100.0;
+                        let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
+                        Some(compute_pacing(
+                            wp,
+                            elapsed_pct,
+                            config.under_pace_threshold,
+                            config.over_pace_threshold,
+                        ))
+                    } else {
+                        previous_state.claude.week_pacing.clone()
+                    }
                 }
-            }
-            _ => previous_state.claude.session_pacing.clone(),
-        };
+                _ => previous_state.claude.week_pacing.clone(),
+            };
 
-        let week_pacing = match week_reset_dt {
-            Some(reset) => {
-                let window_start = reset - Duration::days(7);
-                let total_dur = reset - window_start;
-                let elapsed = *current_time - window_start;
-                if total_dur.num_seconds() > 0 {
-                    let elapsed_pct =
-                        (elapsed.num_seconds() as f64 / total_dur.num_seconds() as f64) * 100.0;
-                    let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
-                    Some(compute_pacing(
-                        wp,
-                        elapsed_pct,
-                        config.under_pace_threshold,
-                        config.over_pace_threshold,
-                    ))
-                } else {
-                    previous_state.claude.week_pacing.clone()
-                }
-            }
-            _ => previous_state.claude.week_pacing.clone(),
-        };
-
-        let claude = ClaudeState {
-            session_used_pct: Some(sp),
-            session_reset_time_text: Some(sr),
-            session_pacing,
-            session_window_start: session_start_str,
-            week_used_pct: Some(wp),
-            week_reset_time_text: Some(wr),
-            week_pacing,
-            ..Default::default()
-        };
-
-        (
-            DisplayState {
-                claude,
+            let claude = ClaudeState {
+                enabled: true,
+                session_used_pct: Some(sp),
+                session_reset_time_text: Some(sr),
+                session_pacing,
+                session_window_start: session_start_str,
+                week_used_pct: Some(wp),
+                week_reset_time_text: Some(wr),
+                week_pacing,
                 ..Default::default()
-            },
-            true,
-        )
-    } else if awaiting_session {
-        let (wp, wr) = parsed
-            .as_ref()
-            .and_then(|p| p.week.clone())
-            .expect("awaiting_session implies week is Some");
-        let local_offset = *current_time.offset();
-        let current_year = current_time.year();
-        let week_reset_dt = parse_reset_datetime(&wr, local_offset, current_year);
+            };
 
-        let week_pacing = match week_reset_dt {
-            Some(reset) => {
-                let window_start = reset - Duration::days(7);
-                let total_dur = reset - window_start;
-                let elapsed = *current_time - window_start;
-                if total_dur.num_seconds() > 0 {
-                    let elapsed_pct =
-                        (elapsed.num_seconds() as f64 / total_dur.num_seconds() as f64) * 100.0;
-                    let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
-                    Some(compute_pacing(
-                        wp,
-                        elapsed_pct,
-                        config.under_pace_threshold,
-                        config.over_pace_threshold,
-                    ))
-                } else {
-                    previous_state.claude.week_pacing.clone()
+            (
+                DisplayState {
+                    claude,
+                    ..Default::default()
+                },
+                true,
+            )
+        } else if awaiting_session {
+            let (wp, wr) = parsed
+                .as_ref()
+                .and_then(|p| p.week.clone())
+                .expect("awaiting_session implies week is Some");
+            let local_offset = *current_time.offset();
+            let current_year = current_time.year();
+            let week_reset_dt = parse_reset_datetime(&wr, local_offset, current_year);
+
+            let week_pacing = match week_reset_dt {
+                Some(reset) => {
+                    let window_start = reset - Duration::days(7);
+                    let total_dur = reset - window_start;
+                    let elapsed = *current_time - window_start;
+                    if total_dur.num_seconds() > 0 {
+                        let elapsed_pct =
+                            (elapsed.num_seconds() as f64 / total_dur.num_seconds() as f64) * 100.0;
+                        let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
+                        Some(compute_pacing(
+                            wp,
+                            elapsed_pct,
+                            config.under_pace_threshold,
+                            config.over_pace_threshold,
+                        ))
+                    } else {
+                        previous_state.claude.week_pacing.clone()
+                    }
                 }
-            }
-            _ => previous_state.claude.week_pacing.clone(),
-        };
+                _ => previous_state.claude.week_pacing.clone(),
+            };
 
-        let claude = ClaudeState {
-            session_used_pct: Some(0.0),
-            session_reset_time_text: Some("Not started".to_string()),
-            session_pacing: None,
-            session_window_start: None,
-            week_used_pct: Some(wp),
-            week_reset_time_text: Some(wr),
-            week_pacing,
-            ..Default::default()
-        };
-
-        (
-            DisplayState {
-                claude,
+            let claude = ClaudeState {
+                enabled: true,
+                session_used_pct: Some(0.0),
+                session_reset_time_text: Some("Not started".to_string()),
+                session_pacing: None,
+                session_window_start: None,
+                week_used_pct: Some(wp),
+                week_reset_time_text: Some(wr),
+                week_pacing,
                 ..Default::default()
-            },
-            true,
-        )
-    } else {
-        let mut display = previous_state.clone();
-        display.claude.stale = raw_usage_text.is_some();
-        // carry diagnostic forward instead of clearing it
-        (display, false)
+            };
+
+            (
+                DisplayState {
+                    claude,
+                    ..Default::default()
+                },
+                true,
+            )
+        } else {
+            let mut display = previous_state.clone();
+            display.claude.stale = raw_usage_text.is_some();
+            // carry diagnostic forward instead of clearing it
+            (display, false)
+        }
     };
 
-    if usage_ok {
-        display.claude.stale = false;
-    } else if raw_usage_text.is_none() {
-        display.claude.stale = true;
+    if claude_enabled {
+        if usage_ok {
+            display.claude.stale = false;
+        } else if raw_usage_text.is_none() {
+            display.claude.stale = true;
+        }
     }
 
     display.codex = update_codex_state(
@@ -942,6 +958,7 @@ mod tests {
             &now,
             &config,
             &prev,
+            true,
             false,
             None,
         );
@@ -986,7 +1003,7 @@ mod tests {
         // not the clean "no session line at all" case, so it must stay Stale.
         let text = "Current session: used \u{00b7} resets Jul 13, 8:40pm (Asia/Jakarta)\nCurrent week (all models): 13% used \u{00b7} resets Jul 18, 4am (Asia/Jakarta)";
 
-        let (display, _events) = poll_cycle(Some(text), &now, &config, &prev, false, None);
+        let (display, _events) = poll_cycle(Some(text), &now, &config, &prev, true, false, None);
 
         assert!(
             display.claude.stale,
@@ -1014,7 +1031,7 @@ mod tests {
         let prev = DisplayState::default();
 
         let (display, _events) =
-            poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev, false, None);
+            poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev, true, false, None);
 
         assert!(!display.claude.stale);
         assert_eq!(display.claude.session_used_pct, Some(8.0));
@@ -1032,7 +1049,7 @@ mod tests {
         let config = Config::default();
         let prev = DisplayState::default();
 
-        let (display, _events) = poll_cycle(None, &now, &config, &prev, false, None);
+        let (display, _events) = poll_cycle(None, &now, &config, &prev, true, false, None);
 
         assert!(display.claude.stale);
         assert_eq!(display.claude.session_used_pct, None);
@@ -1058,6 +1075,7 @@ mod tests {
             &now,
             &config,
             &prev,
+            true,
             false,
             None,
         );
@@ -1065,6 +1083,89 @@ mod tests {
         assert!(display.claude.stale);
         assert_eq!(display.claude.session_used_pct, Some(8.0));
         assert_eq!(display.claude.week_used_pct, Some(13.0));
+    }
+
+    #[test]
+    fn test_claude_disabled_with_no_prev_returns_default() {
+        let now = make_time(14, 0, 0);
+        let config = Config::default();
+        let (display, _events) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &now,
+            &config,
+            &DisplayState::default(),
+            false,
+            false,
+            None,
+        );
+        assert_eq!(
+            display.claude,
+            ClaudeState {
+                enabled: false,
+                ..Default::default()
+            }
+        );
+        assert!(!display.claude.stale);
+        assert!(display.claude.diagnostic.is_none());
+    }
+
+    #[test]
+    fn test_claude_disabled_with_prev_fresh_does_not_persist_old() {
+        let now = make_time(14, 0, 0);
+        let config = Config::default();
+        let prev = DisplayState {
+            claude: ClaudeState {
+                enabled: true,
+                session_used_pct: Some(50.0),
+                session_reset_time_text: Some("old session".into()),
+                week_used_pct: Some(30.0),
+                week_reset_time_text: Some("old week".into()),
+                stale: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (display, _events) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &now,
+            &config,
+            &prev,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(
+            display.claude,
+            ClaudeState {
+                enabled: false,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn test_claude_re_enabled_after_disabled_cycle_reads_fresh() {
+        let now = make_time(14, 0, 0);
+        let config = Config::default();
+        let prev = DisplayState {
+            claude: ClaudeState {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (display, _events) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &now,
+            &config,
+            &prev,
+            true,
+            false,
+            None,
+        );
+        assert_eq!(display.claude.session_used_pct, Some(8.0));
+        assert_eq!(display.claude.week_used_pct, Some(13.0));
+        assert!(display.claude.enabled);
     }
 
     #[test]
@@ -1086,6 +1187,7 @@ mod tests {
             &now,
             &config,
             &DisplayState::default(),
+            true,
             false,
             Some(&result),
         );
@@ -1119,6 +1221,7 @@ mod tests {
             &now,
             &config,
             &DisplayState::default(),
+            true,
             true,
             Some(&result),
         );
@@ -1166,6 +1269,7 @@ mod tests {
             &Config::default(),
             &DisplayState::default(),
             true,
+            true,
             Some(&result),
         );
         assert_eq!(display.codex.windows.len(), 2);
@@ -1193,6 +1297,7 @@ mod tests {
             &make_time(14, 0, 0),
             &Config::default(),
             &DisplayState::default(),
+            true,
             true,
             Some(&result),
         );
@@ -1235,6 +1340,7 @@ mod tests {
             &Config::default(),
             &previous,
             true,
+            true,
             Some(&result),
         );
         assert_eq!(display.codex.windows[0].pacing, None);
@@ -1258,6 +1364,7 @@ mod tests {
             &Config::default(),
             &DisplayState::default(),
             true,
+            true,
             Some(&exhausted),
         );
         assert_eq!(before.codex.windows[0].pacing, Some(Pacing::Overusing));
@@ -1267,9 +1374,79 @@ mod tests {
             &Config::default(),
             &DisplayState::default(),
             true,
+            true,
             Some(&exhausted),
         );
         assert_eq!(after.codex.windows[0].pacing, Some(Pacing::OnPace));
+    }
+
+    #[test]
+    fn test_claude_disabled_produces_no_claude_events_across_cycles() {
+        let config = Config::default();
+        let prev = DisplayState::default();
+        // Two cycles that would cross a DeepSeek window boundary, verifying
+        // only DeepSeek events fire — Claude produces no events of its own.
+        let (d1, e1) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &make_time(8, 0, 0),
+            &config,
+            &prev,
+            false,
+            false,
+            None,
+        );
+        let (_d2, e2) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &make_time(10, 0, 0),
+            &config,
+            &d1,
+            false,
+            false,
+            None,
+        );
+        let all_deepseek = e1
+            .iter()
+            .chain(e2.iter())
+            .all(|e| matches!(e, NotificationEvent::DeepSeekPeakStarted { .. }));
+        assert!(
+            all_deepseek,
+            "only DeepSeek events should fire when Claude is disabled"
+        );
+        assert_eq!(e1.len(), 1);
+        assert_eq!(e2.len(), 0);
+    }
+
+    #[test]
+    fn test_claude_disabled_codex_failure_still_shows_codex_diagnostic() {
+        let now = make_time(14, 0, 0);
+        let config = Config::default();
+        let result = CodexPollResult::Failure {
+            diagnostic: "Codex rate-limit request timed out.".into(),
+        };
+        let (display, _events) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &now,
+            &config,
+            &DisplayState::default(),
+            false,
+            true,
+            Some(&result),
+        );
+        assert_eq!(
+            display.claude,
+            ClaudeState {
+                enabled: false,
+                ..Default::default()
+            },
+            "Claude should be default/empty when disabled"
+        );
+        assert_eq!(
+            display.codex.diagnostic.as_deref(),
+            Some("Codex rate-limit request timed out."),
+            "Codex diagnostic must remain visible even with Claude disabled"
+        );
+        assert!(display.codex.enabled);
+        assert!(!display.codex.available);
     }
 
     #[test]
@@ -1285,6 +1462,7 @@ mod tests {
             &now,
             &config,
             &DisplayState::default(),
+            true,
             true,
             Some(&result),
         );
@@ -1327,6 +1505,7 @@ mod tests {
             &make_time(14, 0, 0),
             &Config::default(),
             &previous,
+            true,
             true,
             Some(&result),
         );
@@ -1374,6 +1553,7 @@ mod tests {
             &Config::default(),
             &previous,
             true,
+            true,
             Some(&result),
         );
         assert!(!display.codex.stale);
@@ -1415,6 +1595,7 @@ mod tests {
             &make_time(14, 0, 0),
             &Config::default(),
             &previous,
+            true,
             false,
             Some(&result),
         );
@@ -1451,6 +1632,7 @@ mod tests {
                 &make_time(14, 0, 0),
                 &Config::default(),
                 &DisplayState::default(),
+                true,
                 true,
                 Some(&result),
             );
@@ -1745,7 +1927,7 @@ mod tests {
         let now = beijing_time(10, 0, 0);
 
         let (_display, events) =
-            poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev, false, None);
+            poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev, true, false, None);
 
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -1768,7 +1950,7 @@ mod tests {
         let now = beijing_time(13, 0, 0);
 
         let (_display, events) =
-            poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev, false, None);
+            poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev, true, false, None);
 
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -1787,7 +1969,7 @@ mod tests {
         let now = beijing_time(13, 0, 0);
 
         let (_display, events) =
-            poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev, false, None);
+            poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev, true, false, None);
 
         assert_eq!(events.len(), 0);
     }

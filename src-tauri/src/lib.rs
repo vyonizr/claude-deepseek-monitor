@@ -32,6 +32,8 @@ struct SavedSettings {
     widget_opacity: f64,
     #[serde(default)]
     enable_codex: bool,
+    #[serde(default = "default_enable_claude")]
+    enable_claude: bool,
 }
 
 fn default_under_pace_threshold() -> u32 {
@@ -48,6 +50,10 @@ fn default_poll_interval_minutes() -> u32 {
 
 fn default_widget_opacity() -> f64 {
     0.92
+}
+
+fn default_enable_claude() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -75,6 +81,7 @@ impl Default for SavedSettings {
             over_pace_threshold: default_over_pace_threshold(),
             widget_opacity: default_widget_opacity(),
             enable_codex: false,
+            enable_claude: default_enable_claude(),
         }
     }
 }
@@ -149,6 +156,7 @@ fn state_to_json(state: &poll_cycle::DisplayState, opacity: f64) -> serde_json::
         "next_transition": state.next_transition_info,
         "stale": claude.stale,
         "diagnostic": claude.diagnostic,
+        "claude_enabled": claude.enabled,
         "codex_enabled": codex.enabled,
         "codex_loading": codex.loading,
         "codex_available": codex.available,
@@ -564,8 +572,10 @@ fn run_poll_cycle(app: &tauri::AppHandle) -> bool {
     let fixed_offset = *local_now.offset();
     let current_time = local_now.with_timezone(&fixed_offset);
 
-    let config = settings_to_config(&load_settings(app));
-    let codex_enabled = load_settings(app).enable_codex;
+    let settings = load_settings(app);
+    let config = settings_to_config(&settings);
+    let codex_enabled = settings.enable_codex;
+    let claude_enabled = settings.enable_claude;
 
     let state_container = app.state::<Mutex<AppState>>();
     let previous_state = {
@@ -580,92 +590,107 @@ fn run_poll_cycle(app: &tauri::AppHandle) -> bool {
             let loading_state = state_lock.poll_cycle_state.clone();
             emit_state_update(app, &loading_state);
         }
+        if claude_enabled && !state_lock.poll_cycle_state.claude.enabled {
+            state_lock.poll_cycle_state.claude = poll_cycle::ClaudeState {
+                enabled: true,
+                ..Default::default()
+            };
+        }
         (state_lock.poll_cycle_state.clone(), settings_generation)
     };
     let (previous_state, settings_generation) = previous_state;
 
-    // The claude CLI occasionally returns a malformed/incomplete response on its
-    // first invocation right after the app cold-starts (auth/session warmup),
-    // then succeeds immediately after. Retry once before surfacing a diagnostic,
-    // rather than showing a scary error for a whole poll interval.
-    const MAX_ATTEMPTS: u32 = 2;
-    let mut attempt = 1;
-    let (mut new_state, events, raw_text, cmd_diagnostic) = loop {
-        // Codex is optional and must not hold up Claude's subprocess. Its own
-        // worker has a ten-second deadline; Claude and Codex share this poll
-        // cycle without sharing failure/backoff state.
-        let codex_thread = if codex_enabled {
-            Some(std::thread::spawn(run_codex_command))
-        } else {
-            None
-        };
-        let (raw_text, cmd_diagnostic) = match run_claude_command() {
-            Ok(text) => {
-                eprintln!("[monitor] claude OK, {} bytes received", text.len());
-                (Some(text), None)
-            }
-            Err(diag) => {
-                eprintln!("[monitor] claude FAIL: {diag}");
-                (None, Some(diag))
-            }
-        };
-
-        eprintln!("[monitor] running poll_cycle() (attempt {attempt})");
-        let codex_result = match codex_thread {
-            Some(thread) => Some(
-                thread
-                    .join()
-                    .unwrap_or_else(|_| codex_failure("Codex poll worker failed.")),
-            ),
-            None => None,
-        };
-        // A setting save may disable Codex while the worker is in flight. Do
-        // not apply a late result or retain a stale Codex section in that case.
+    #[allow(unused_mut, unused_variables)]
+    let (mut new_state, events, _raw_text, _cmd_diagnostic) = if !claude_enabled {
         let codex_enabled_now = load_settings(app).enable_codex;
         let (new_state, events) = poll_cycle::poll_cycle(
-            raw_text.as_deref(),
+            None,
             &current_time,
             &config,
             &previous_state,
+            false,
             codex_enabled_now,
-            codex_result.as_ref(),
+            None,
         );
+        (new_state, events, None::<String>, None::<String>)
+    } else {
+        const MAX_ATTEMPTS: u32 = 2;
+        let mut attempt = 1;
+        let (mut new_state, events, raw_text, cmd_diagnostic) = loop {
+            let codex_thread = if codex_enabled {
+                Some(std::thread::spawn(run_codex_command))
+            } else {
+                None
+            };
+            let (raw_text, cmd_diagnostic) = match run_claude_command() {
+                Ok(text) => {
+                    eprintln!("[monitor] claude OK, {} bytes received", text.len());
+                    (Some(text), None)
+                }
+                Err(diag) => {
+                    eprintln!("[monitor] claude FAIL: {diag}");
+                    (None, Some(diag))
+                }
+            };
 
-        eprintln!(
-            "[monitor] poll_cycle done, events={}, stale={}, session_pct={:?}, week_pct={:?}",
-            events.len(),
-            new_state.claude.stale,
-            new_state.claude.session_used_pct,
-            new_state.claude.week_used_pct
-        );
+            eprintln!("[monitor] running poll_cycle() (attempt {attempt})");
+            let codex_result = match codex_thread {
+                Some(thread) => Some(
+                    thread
+                        .join()
+                        .unwrap_or_else(|_| codex_failure("Codex poll worker failed.")),
+                ),
+                None => None,
+            };
+            let codex_enabled_now = load_settings(app).enable_codex;
+            let claude_enabled_now = load_settings(app).enable_claude;
+            let (new_state, events) = poll_cycle::poll_cycle(
+                raw_text.as_deref(),
+                &current_time,
+                &config,
+                &previous_state,
+                claude_enabled_now,
+                codex_enabled_now,
+                codex_result.as_ref(),
+            );
 
-        let parse_failed = raw_text.is_some()
-            && new_state.claude.stale
-            && new_state.claude.session_used_pct.is_none();
+            eprintln!(
+                "[monitor] poll_cycle done, events={}, stale={}, session_pct={:?}, week_pct={:?}",
+                events.len(),
+                new_state.claude.stale,
+                new_state.claude.session_used_pct,
+                new_state.claude.week_used_pct
+            );
 
-        if parse_failed && attempt < MAX_ATTEMPTS {
-            eprintln!("[monitor] parse failed on attempt {attempt}, retrying claude command");
-            attempt += 1;
-            continue;
+            let parse_failed = raw_text.is_some()
+                && new_state.claude.stale
+                && new_state.claude.session_used_pct.is_none();
+
+            if parse_failed && attempt < MAX_ATTEMPTS {
+                eprintln!("[monitor] parse failed on attempt {attempt}, retrying claude command");
+                attempt += 1;
+                continue;
+            }
+
+            break (new_state, events, raw_text, cmd_diagnostic);
+        };
+
+        if let Some(ref text) = raw_text {
+            if new_state.claude.stale && new_state.claude.session_used_pct.is_none() {
+                let preview: String = text.chars().take(200).collect();
+                eprintln!("[monitor] PARSE FAILED. Raw output (200 chars):\n---\n{preview}\n---");
+                new_state.claude.diagnostic = Some(format!("Unexpected output: {preview}"));
+            }
         }
 
-        break (new_state, events, raw_text, cmd_diagnostic);
+        if let Some(diag) = cmd_diagnostic {
+            new_state.claude.diagnostic = Some(diag);
+        }
+
+        (new_state, events, raw_text, None::<String>)
     };
 
-    // If the subprocess ran but parsing failed, show the raw output as diagnostic
-    if let Some(ref text) = raw_text {
-        if new_state.claude.stale && new_state.claude.session_used_pct.is_none() {
-            let preview: String = text.chars().take(200).collect();
-            eprintln!("[monitor] PARSE FAILED. Raw output (200 chars):\n---\n{preview}\n---");
-            new_state.claude.diagnostic = Some(format!("Unexpected output: {preview}"));
-        }
-    }
-
-    if let Some(diag) = cmd_diagnostic {
-        new_state.claude.diagnostic = Some(diag);
-    }
-
-    let succeeded = new_state.claude.diagnostic.is_none();
+    let succeeded = new_state.claude.diagnostic.is_none() || !claude_enabled;
     let display_state = new_state.clone();
     {
         let mut state_lock = state_container.lock().unwrap();
@@ -708,6 +733,7 @@ fn get_settings(app: tauri::AppHandle) -> serde_json::Value {
         "over_pace_threshold": settings.over_pace_threshold,
         "widget_opacity": settings.widget_opacity,
         "enable_codex": settings.enable_codex,
+        "enable_claude": settings.enable_claude,
     })
 }
 
@@ -758,6 +784,10 @@ fn save_settings(app: tauri::AppHandle, settings: serde_json::Value) -> Result<(
         .get("enable_codex")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let enable_claude = settings
+        .get("enable_claude")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     let saved = SavedSettings {
         deepseek_windows: windows,
@@ -767,6 +797,7 @@ fn save_settings(app: tauri::AppHandle, settings: serde_json::Value) -> Result<(
         over_pace_threshold,
         widget_opacity,
         enable_codex,
+        enable_claude,
     };
 
     {
@@ -782,10 +813,13 @@ fn save_settings(app: tauri::AppHandle, settings: serde_json::Value) -> Result<(
         let current = {
             let mut state = state.lock().unwrap();
             if !enable_codex {
-                // Clear the visible source before emitting the save result.
-                // The generation increment above also makes an in-flight
-                // Codex worker's result ineligible for state publication.
                 state.poll_cycle_state.codex = poll_cycle::CodexState::default();
+            }
+            if !enable_claude {
+                state.poll_cycle_state.claude = poll_cycle::ClaudeState {
+                    enabled: false,
+                    ..Default::default()
+                };
             }
             state.poll_cycle_state.clone()
         };
@@ -881,7 +915,7 @@ pub fn run() {
                             WebviewUrl::App("settings.html".into()),
                         )
                         .title("Settings")
-                        .inner_size(320.0, 360.0)
+                        .inner_size(320.0, 390.0)
                         .resizable(false)
                         .build();
                     }
@@ -1084,5 +1118,26 @@ mod tests {
             codex_exit_diagnostic(None, "fatal: authentication required; token=secret");
         assert_eq!(diagnostic, "Codex login required: run `codex login`.");
         assert!(!diagnostic.contains("secret"));
+    }
+
+    #[test]
+    fn settings_without_enable_claude_defaults_to_true() {
+        let json = r#"{"deepseek_windows":[],"auto_launch":false,"poll_interval_minutes":5,"under_pace_threshold":1,"over_pace_threshold":1,"widget_opacity":0.9,"enable_codex":false}"#;
+        let settings: SavedSettings = serde_json::from_str(json).unwrap();
+        assert!(settings.enable_claude, "missing enable_claude must default to true");
+    }
+
+    #[test]
+    fn settings_with_enable_claude_false_parses_correctly() {
+        let json = r#"{"deepseek_windows":[],"auto_launch":false,"poll_interval_minutes":5,"under_pace_threshold":1,"over_pace_threshold":1,"widget_opacity":0.9,"enable_codex":false,"enable_claude":false}"#;
+        let settings: SavedSettings = serde_json::from_str(json).unwrap();
+        assert!(!settings.enable_claude);
+    }
+
+    #[test]
+    fn settings_with_enable_claude_true_parses_correctly() {
+        let json = r#"{"deepseek_windows":[],"auto_launch":false,"poll_interval_minutes":5,"under_pace_threshold":1,"over_pace_threshold":1,"widget_opacity":0.9,"enable_codex":false,"enable_claude":true}"#;
+        let settings: SavedSettings = serde_json::from_str(json).unwrap();
+        assert!(settings.enable_claude);
     }
 }

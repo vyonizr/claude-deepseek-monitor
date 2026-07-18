@@ -79,6 +79,7 @@
     </div>
     <div id="diagnostic" class="diagnostic"></div>
   </div>
+  <script src="codex-format.js"></script>
   <script>
     (function() {
       var T = window.__TAURI__;
@@ -130,19 +131,19 @@
           windows.forEach(function(window) {
             var row = document.createElement('div');
             row.className = 'codex-window';
-            var top = document.createElement('div');
-            top.className = 'row';
             var label = document.createElement('span');
             label.className = 'label'; label.textContent = window.label;
+            var top = document.createElement('div');
+            top.className = 'row';
             var pct = document.createElement('span');
             pct.className = 'value'; pct.textContent = window.used_pct;
             var pace = document.createElement('span');
             pace.className = 'pacer';
             if (window.pacing) { pace.textContent = labels[window.pacing] || window.pacing.toUpperCase(); pace.className = 'pacer ' + window.pacing; }
-            top.appendChild(label); top.appendChild(pct); top.appendChild(pace);
+            top.appendChild(pct); top.appendChild(pace);
             var reset = document.createElement('div');
-            reset.className = 'row'; reset.style = 'font-size:9px;color:#666'; reset.textContent = window.reset || '';
-            row.appendChild(top); row.appendChild(reset); container.appendChild(row);
+            reset.className = 'row'; reset.style = 'font-size:9px;color:#666'; reset.textContent = codexFormatResetTime(window.reset);
+            row.appendChild(label); row.appendChild(top); row.appendChild(reset); container.appendChild(row);
           });
           var statusText = s.codex_loading ? 'Loading…' : (s.codex_diagnostic || (!s.codex_available ? 'Unavailable' : ''));
           document.getElementById('codex-status').textContent = statusText;

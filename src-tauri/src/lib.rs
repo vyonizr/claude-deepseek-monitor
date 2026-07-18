@@ -142,17 +142,22 @@ fn to_json(state: &poll_cycle::DisplayState, app: &tauri::AppHandle) -> serde_js
         "codex_available": codex.available,
         "codex_stale": codex.stale,
         "codex_diagnostic": codex.diagnostic,
-        "codex_primary": codex.primary.as_ref().map(|window| serde_json::json!({
-            "label": window.label,
-            "used_pct": format!("{:.0}%", window.used_pct),
-            "reset": window.reset_time_text,
-            "pacing": window.pacing.as_ref().map(|p| match p {
+        "codex_primary": codex.primary.as_ref().map(codex_window_json),
+        "codex_windows": codex.windows.iter().map(codex_window_json).collect::<Vec<_>>(),
+        "widget_opacity": opacity,
+    })
+}
+
+fn codex_window_json(window: &poll_cycle::CodexWindowState) -> serde_json::Value {
+    serde_json::json!({
+        "label": window.label,
+        "used_pct": format!("{:.0}%", window.used_pct),
+        "reset": window.reset_time_text,
+        "pacing": window.pacing.as_ref().map(|p| match p {
                 poll_cycle::Pacing::Underusing => "under",
                 poll_cycle::Pacing::OnPace => "onpace",
                 poll_cycle::Pacing::Overusing => "over",
             }),
-        })),
-        "widget_opacity": opacity,
     })
 }
 
@@ -258,46 +263,6 @@ fn classify_codex_error(message: &str) -> poll_cycle::CodexPollResult {
     } else {
         codex_failure("Codex rate-limit poll failed.")
     }
-}
-
-fn codex_primary_from_response(
-    response: &serde_json::Value,
-) -> Result<poll_cycle::CodexPollResult, String> {
-    let result = response
-        .get("result")
-        .ok_or_else(|| "missing rate-limit response".to_string())?;
-    let snapshot = result
-        .get("rateLimitsByLimitId")
-        .and_then(|groups| groups.get("codex"))
-        .or_else(|| result.get("rateLimits"))
-        .ok_or_else(|| "rate-limit response has no compatible snapshot".to_string())?;
-    let primary = snapshot
-        .get("primary")
-        .or_else(|| snapshot.get("primaryWindow"))
-        .ok_or_else(|| "rate-limit response has no primary window".to_string())?;
-    let used_pct = primary
-        .get("usedPercent")
-        .or_else(|| primary.get("used_percent"))
-        .and_then(|value| value.as_f64())
-        .ok_or_else(|| "primary rate-limit window is missing usedPercent".to_string())?;
-    let window_duration_mins = primary
-        .get("windowDurationMins")
-        .or_else(|| primary.get("window_duration_mins"))
-        .and_then(|value| value.as_i64());
-    let reset_at = primary
-        .get("resetsAt")
-        .or_else(|| primary.get("resets_at"))
-        .and_then(|value| value.as_i64())
-        .and_then(|seconds| chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, 0))
-        .map(|date| date.with_timezone(&chrono::FixedOffset::east_opt(0).unwrap()));
-    let reset_time_text = reset_at.as_ref().map(chrono::DateTime::to_rfc3339);
-
-    Ok(poll_cycle::CodexPollResult::Success {
-        used_pct,
-        reset_at,
-        reset_time_text,
-        window_duration_mins,
-    })
 }
 
 fn run_codex_command() -> poll_cycle::CodexPollResult {
@@ -408,7 +373,7 @@ fn run_codex_command() -> poll_cycle::CodexPollResult {
         };
         let _ = child.kill();
         let _ = child.wait();
-        return match codex_primary_from_response(&response) {
+        return match poll_cycle::parse_codex_response(&response) {
             Ok(result) => result,
             Err(message) => classify_codex_error(&message),
         };

@@ -74,6 +74,7 @@ pub struct CodexState {
     pub stale: bool,
     pub diagnostic: Option<String>,
     pub primary: Option<CodexWindowState>,
+    pub windows: Vec<CodexWindowState>,
 }
 
 impl Default for CodexState {
@@ -85,6 +86,7 @@ impl Default for CodexState {
             stale: false,
             diagnostic: None,
             primary: None,
+            windows: Vec::new(),
         }
     }
 }
@@ -92,14 +94,63 @@ impl Default for CodexState {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CodexPollResult {
     Success {
-        used_pct: f64,
-        reset_at: Option<chrono::DateTime<FixedOffset>>,
-        reset_time_text: Option<String>,
-        window_duration_mins: Option<i64>,
+        windows: Vec<CodexPollWindow>,
     },
     Failure {
         diagnostic: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodexPollWindow {
+    pub kind: CodexWindowKind,
+    pub used_pct: f64,
+    pub reset_at: Option<chrono::DateTime<FixedOffset>>,
+    pub reset_time_text: Option<String>,
+    pub window_duration_mins: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CodexWindowKind {
+    Primary,
+    Secondary,
+}
+
+/// Parse the current and legacy app-server response shapes into the pure
+/// poll-cycle model. Only the named Codex group and its primary/secondary
+/// windows are relevant; controls such as credits are deliberately ignored.
+pub fn parse_codex_response(response: &serde_json::Value) -> Result<CodexPollResult, String> {
+    let result = response.get("result").ok_or_else(|| "missing rate-limit response".to_string())?;
+    let snapshot = result.get("rateLimitsByLimitId")
+        .and_then(|groups| groups.get("codex"))
+        .filter(|snapshot| !snapshot.is_null())
+        .or_else(|| result.get("rateLimits"))
+        .ok_or_else(|| "rate-limit response has no compatible snapshot".to_string())?;
+    let mut windows = Vec::new();
+    for (kind, names) in [
+        (CodexWindowKind::Primary, ["primary", "primaryWindow"]),
+        (CodexWindowKind::Secondary, ["secondary", "secondaryWindow"]),
+    ] {
+        if let Some(window) = names.iter().find_map(|name| snapshot.get(name)) {
+            if window.is_null() { continue; }
+            let name = if kind == CodexWindowKind::Primary { "primary" } else { "secondary" };
+            let used_pct = window.get("usedPercent").or_else(|| window.get("used_percent"))
+                .and_then(|value| value.as_f64())
+                .ok_or_else(|| format!("{name} rate-limit window is missing usedPercent"))?;
+            let window_duration_mins = window.get("windowDurationMins").or_else(|| window.get("window_duration_mins"))
+                .and_then(|value| value.as_i64());
+            let reset_value = window.get("resetsAt").or_else(|| window.get("resets_at"));
+            let reset_at = reset_value.and_then(|value| value.as_i64())
+                .and_then(|seconds| DateTime::<chrono::Utc>::from_timestamp(seconds, 0))
+                .map(|date| date.with_timezone(&FixedOffset::east_opt(0).unwrap()))
+                .or_else(|| reset_value.and_then(|value| value.as_str()).and_then(|text| DateTime::parse_from_rfc3339(text).ok()));
+            let reset_time_text = reset_value.and_then(|value| value.as_str()).map(str::to_owned)
+                .or_else(|| reset_at.as_ref().map(DateTime::to_rfc3339));
+            windows.push(CodexPollWindow { kind, used_pct, reset_at, reset_time_text, window_duration_mins });
+        }
+    }
+    if windows.is_empty() { return Err("rate-limit response has no usable windows".into()); }
+    Ok(CodexPollResult::Success { windows })
 }
 
 impl Default for ClaudeState {
@@ -566,22 +617,29 @@ fn update_codex_state(
                 stale: previous.available,
                 diagnostic: Some(diagnostic.clone()),
                 primary: previous.primary.clone(),
+                windows: previous.windows.clone(),
             }
         }
-        CodexPollResult::Success {
-            used_pct,
-            reset_at,
-            reset_time_text,
-            window_duration_mins,
-        } => {
-            let pacing = match (reset_at, window_duration_mins) {
-                (Some(reset), Some(duration)) if *duration > 0 => {
-                    let start = *reset - Duration::minutes(*duration);
-                    let total = *reset - start;
+        CodexPollResult::Success { windows } => {
+            let primary_index = windows.iter().position(|window| window.kind == CodexWindowKind::Primary);
+            let windows = windows.iter().map(|window| {
+                let pacing = match (window.reset_at, window.window_duration_mins) {
+                (Some(reset), Some(duration)) if duration > 0 => {
+                    let start = reset - Duration::minutes(duration);
+                    let total = reset - start;
                     let elapsed = (*current_time - start).num_seconds() as f64;
-                    let elapsed_pct = (elapsed / total.num_seconds() as f64 * 100.0).clamp(0.0, 100.0);
+                    let elapsed_pct = if total.num_seconds() > 0 {
+                        (elapsed / total.num_seconds() as f64 * 100.0).clamp(0.0, 100.0)
+                    } else {
+                        return CodexWindowState {
+                            label: window_label(window),
+                            used_pct: window.used_pct,
+                            reset_time_text: window.reset_time_text.clone(),
+                            pacing: None,
+                        };
+                    };
                     Some(compute_pacing(
-                        *used_pct,
+                        window.used_pct,
                         elapsed_pct,
                         config.under_pace_threshold,
                         config.over_pace_threshold,
@@ -589,22 +647,32 @@ fn update_codex_state(
                 }
                 _ => None,
             };
-            let label = window_duration_mins.map(codex_duration_label).unwrap_or_else(|| "Codex".into());
+            CodexWindowState {
+                label: window_label(window),
+                used_pct: window.used_pct,
+                reset_time_text: window.reset_time_text.clone(),
+                pacing,
+            }
+            }).collect::<Vec<_>>();
+            let primary = primary_index.and_then(|index| windows.get(index).cloned());
             CodexState {
                 enabled: true,
                 loading: false,
                 available: true,
                 stale: false,
                 diagnostic: None,
-                primary: Some(CodexWindowState {
-                    label,
-                    used_pct: *used_pct,
-                    reset_time_text: reset_time_text.clone(),
-                    pacing,
-                }),
+                primary,
+                windows,
             }
         }
     }
+}
+
+fn window_label(window: &CodexPollWindow) -> String {
+    window.window_duration_mins.map(codex_duration_label).unwrap_or_else(|| match window.kind {
+        CodexWindowKind::Primary => "Primary".into(),
+        CodexWindowKind::Secondary => "Secondary".into(),
+    })
 }
 
 pub fn codex_duration_label(minutes: i64) -> String {
@@ -814,10 +882,10 @@ mod tests {
         let now = make_time(14, 0, 0);
         let config = Config::default();
         let result = CodexPollResult::Success {
-            used_pct: 25.0,
-            reset_at: None,
-            reset_time_text: None,
-            window_duration_mins: Some(300),
+            windows: vec![CodexPollWindow {
+                kind: CodexWindowKind::Primary, used_pct: 25.0, reset_at: None,
+                reset_time_text: None, window_duration_mins: Some(300),
+            }],
         };
 
         let (display, events) = poll_cycle(
@@ -839,10 +907,10 @@ mod tests {
         let config = Config::default();
         let reset_at = chrono::DateTime::parse_from_rfc3339("2026-07-13T15:00:00+07:00").unwrap();
         let result = CodexPollResult::Success {
-            used_pct: 50.0,
-            reset_at: Some(reset_at),
-            reset_time_text: Some(reset_at.to_rfc3339()),
-            window_duration_mins: Some(300),
+            windows: vec![CodexPollWindow {
+                kind: CodexWindowKind::Primary, used_pct: 50.0, reset_at: Some(reset_at),
+                reset_time_text: Some(reset_at.to_rfc3339()), window_duration_mins: Some(300),
+            }],
         };
 
         let (display, events) = poll_cycle(
@@ -861,6 +929,59 @@ mod tests {
         assert_eq!(primary.used_pct, 50.0);
         assert_eq!(primary.pacing, Some(Pacing::Underusing));
         assert!(events.iter().all(|event| matches!(event, NotificationEvent::DeepSeekPeakStarted { .. })));
+    }
+
+    #[test]
+    fn test_codex_primary_and_secondary_windows_are_both_displayed() {
+        let now = make_time(14, 0, 0);
+        let reset = chrono::DateTime::parse_from_rfc3339("2026-07-13T15:00:00+07:00").unwrap();
+        let result = CodexPollResult::Success { windows: vec![
+            CodexPollWindow { kind: CodexWindowKind::Primary, used_pct: 50.0, reset_at: Some(reset), reset_time_text: Some("primary reset".into()), window_duration_mins: Some(300) },
+            CodexPollWindow { kind: CodexWindowKind::Secondary, used_pct: 25.0, reset_at: Some(reset), reset_time_text: Some("secondary reset".into()), window_duration_mins: Some(7 * 24 * 60) },
+        ] };
+        let (display, events) = poll_cycle(Some(VALID_USAGE_TEXT), &now, &Config::default(), &DisplayState::default(), true, Some(&result));
+        assert_eq!(display.codex.windows.len(), 2);
+        assert_eq!(display.codex.windows[0].label, "5-hour");
+        assert_eq!(display.codex.windows[1].label, "7-day");
+        assert!(events.iter().all(|event| matches!(event, NotificationEvent::DeepSeekPeakStarted { .. } | NotificationEvent::DeepSeekPeakEnded)));
+    }
+
+    #[test]
+    fn test_codex_missing_optional_secondary_is_success() {
+        let result = CodexPollResult::Success { windows: vec![CodexPollWindow {
+            kind: CodexWindowKind::Primary, used_pct: 10.0, reset_at: None, reset_time_text: None, window_duration_mins: None,
+        }] };
+        let (display, _) = poll_cycle(Some(VALID_USAGE_TEXT), &make_time(14, 0, 0), &Config::default(), &DisplayState::default(), true, Some(&result));
+        assert!(display.codex.available);
+        assert_eq!(display.codex.windows.len(), 1);
+        assert_eq!(display.codex.windows[0].pacing, None);
+        assert_eq!(display.codex.windows[0].used_pct, 10.0);
+    }
+
+    #[test]
+    fn test_codex_fresh_incomplete_metadata_does_not_reuse_old_pace() {
+        let previous = CodexState {
+            enabled: true, available: true, primary: Some(CodexWindowState { label: "5-hour".into(), used_pct: 10.0, reset_time_text: None, pacing: Some(Pacing::Underusing) }),
+            windows: vec![], ..Default::default()
+        };
+        let previous = DisplayState { codex: previous, ..Default::default() };
+        let result = CodexPollResult::Success { windows: vec![CodexPollWindow {
+            kind: CodexWindowKind::Primary, used_pct: 90.0, reset_at: None, reset_time_text: None, window_duration_mins: None,
+        }] };
+        let (display, _) = poll_cycle(Some(VALID_USAGE_TEXT), &make_time(14, 0, 0), &Config::default(), &previous, true, Some(&result));
+        assert_eq!(display.codex.windows[0].pacing, None);
+    }
+
+    #[test]
+    fn test_codex_pacing_clamps_after_reset_and_exhaustion_before_reset() {
+        let reset = chrono::DateTime::parse_from_rfc3339("2026-07-13T15:00:00+07:00").unwrap();
+        let exhausted = CodexPollResult::Success { windows: vec![CodexPollWindow {
+            kind: CodexWindowKind::Primary, used_pct: 100.0, reset_at: Some(reset), reset_time_text: None, window_duration_mins: Some(300),
+        }] };
+        let (before, _) = poll_cycle(Some(VALID_USAGE_TEXT), &make_time(12, 0, 0), &Config::default(), &DisplayState::default(), true, Some(&exhausted));
+        assert_eq!(before.codex.windows[0].pacing, Some(Pacing::Overusing));
+        let (after, _) = poll_cycle(Some(VALID_USAGE_TEXT), &make_time(16, 0, 0), &Config::default(), &DisplayState::default(), true, Some(&exhausted));
+        assert_eq!(after.codex.windows[0].pacing, Some(Pacing::OnPace));
     }
 
     #[test]
@@ -894,6 +1015,37 @@ mod tests {
         assert_eq!(codex_duration_label(90), "90-minute");
         assert_eq!(codex_duration_label(5 * 60), "5-hour");
         assert_eq!(codex_duration_label(7 * 24 * 60), "7-day");
+    }
+
+    #[test]
+    fn test_codex_response_named_bucket_precedes_legacy_and_ignores_other_groups() {
+        let response = serde_json::json!({ "result": {
+            "rateLimitsByLimitId": { "other": { "primary": { "usedPercent": 1.0 } }, "codex": { "primary": { "usedPercent": 42.0, "windowDurationMins": 90 } } },
+            "rateLimits": { "primary": { "usedPercent": 2.0, "windowDurationMins": 5 } }
+        } });
+        let CodexPollResult::Success { windows } = parse_codex_response(&response).unwrap() else { panic!("expected success") };
+        assert_eq!((windows[0].used_pct, windows[0].window_duration_mins), (42.0, Some(90)));
+    }
+
+    #[test]
+    fn test_codex_response_legacy_fallback_and_optional_secondary() {
+        let response = serde_json::json!({ "result": { "rateLimitsByLimitId": { "other": {} }, "rateLimits": {
+            "primary": { "usedPercent": 12.0, "resetsAt": "2026-07-18T10:00:00Z" }
+        } } });
+        let CodexPollResult::Success { windows } = parse_codex_response(&response).unwrap() else { panic!("expected success") };
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].reset_time_text.as_deref(), Some("2026-07-18T10:00:00Z"));
+        assert_eq!(windows[0].kind, CodexWindowKind::Primary);
+    }
+
+    #[test]
+    fn test_codex_response_ignores_credits_spend_histories_and_reset_credits() {
+        let response = serde_json::json!({ "result": { "rateLimitsByLimitId": { "codex": {
+            "primary": { "usedPercent": 12.0 }, "credits": { "usedPercent": 99.0 }, "spend": { "usedPercent": 88.0 },
+            "tokenHistory": { "usedPercent": 77.0 }, "resetCredits": { "usedPercent": 66.0 }
+        } } } });
+        let CodexPollResult::Success { windows } = parse_codex_response(&response).unwrap() else { panic!("expected success") };
+        assert_eq!(windows.len(), 1);
     }
 
     #[test]

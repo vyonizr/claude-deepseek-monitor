@@ -51,6 +51,7 @@
     #codex-section.codex-unavailable .source-diagnostic { color: #f5a623; }
     .source-diagnostic { font-size: 9px; line-height: 11px; color: #e55; overflow-wrap: anywhere; }
     .codex-window { display: flex; flex-direction: column; gap: 1px; }
+    .reset-text { font-size: 10px; color: #e0e0e0; }
   </style>
 </head>
 <body>
@@ -59,12 +60,12 @@
     <div class="section">
       <div class="label">Session</div>
       <div class="row"><span class="value" id="session-pct">--%</span><span class="pacer" id="session-pacer"></span></div>
-      <div class="row" style="font-size:9px;color:#666"><span id="session-reset">--</span></div>
+      <div class="row reset-text"><span id="session-reset">--</span></div>
     </div>
     <div class="section">
       <div class="label">Weekly</div>
       <div class="row"><span class="value" id="week-pct">--%</span><span class="pacer" id="week-pacer"></span></div>
-      <div class="row" style="font-size:9px;color:#666"><span id="week-reset">--</span></div>
+      <div class="row reset-text"><span id="week-reset">--</span></div>
     </div>
     <div id="codex-section">
       <div class="group-header">CODEX</div>
@@ -142,7 +143,7 @@
             if (window.pacing) { pace.textContent = labels[window.pacing] || window.pacing.toUpperCase(); pace.className = 'pacer ' + window.pacing; }
             top.appendChild(pct); top.appendChild(pace);
             var reset = document.createElement('div');
-            reset.className = 'row'; reset.style = 'font-size:9px;color:#666'; reset.textContent = codexFormatResetTime(window.reset);
+            reset.className = 'row reset-text'; reset.textContent = codexFormatResetTime(window.reset);
             row.appendChild(label); row.appendChild(top); row.appendChild(reset); container.appendChild(row);
           });
           var statusText = s.codex_loading ? 'Loading…' : (s.codex_diagnostic || (!s.codex_available ? 'Unavailable' : ''));

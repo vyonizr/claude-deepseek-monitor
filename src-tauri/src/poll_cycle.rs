@@ -136,16 +136,23 @@ pub fn codex_failure_diagnostic(message: &str) -> String {
     }
 }
 
-/// The initialize result is deliberately checked for protocol capabilities,
-/// rather than comparing the installed CLI's version string. This keeps the
-/// monitor compatible with new CLI releases while rejecting unrelated or old
-/// app-server implementations.
-pub fn has_codex_protocol_capabilities(response: &serde_json::Value) -> bool {
+/// A successful initialize response is enough to attempt the rate-limit
+/// request. Codex has changed the shape of its advertised capabilities across
+/// CLI releases, so the rate-limit response is the authoritative compatibility
+/// check rather than a particular `result.capabilities` object shape.
+pub fn has_codex_initialize_result(response: &serde_json::Value) -> bool {
     response
         .get("result")
-        .and_then(|result| result.get("capabilities"))
         .map(serde_json::Value::is_object)
         .unwrap_or(false)
+}
+
+pub fn logical_size_to_physical(width: u32, height: u32, scale_factor: f64) -> (u32, u32) {
+    let scale_factor = scale_factor.max(0.01);
+    (
+        ((width as f64) * scale_factor).round().max(1.0) as u32,
+        ((height as f64) * scale_factor).round().max(1.0) as u32,
+    )
 }
 
 /// Parse the current and legacy app-server response shapes into the pure
@@ -1453,19 +1460,79 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_initialize_requires_capabilities_not_a_version_string() {
-        assert!(has_codex_protocol_capabilities(&serde_json::json!({
+    fn test_codex_initialize_accepts_current_and_legacy_result_shapes() {
+        assert!(has_codex_initialize_result(&serde_json::json!({
             "result": {
                 "serverInfo": { "name": "codex" },
                 "capabilities": { "experimentalApi": true }
             }
         })));
-        assert!(!has_codex_protocol_capabilities(&serde_json::json!({
+        assert!(has_codex_initialize_result(&serde_json::json!({
             "result": { "serverInfo": { "name": "codex", "version": "1.2.3" } }
         })));
-        assert!(!has_codex_protocol_capabilities(&serde_json::json!({
-            "result": { "capabilities": "1.2.3" }
+        assert!(!has_codex_initialize_result(&serde_json::json!({
+            "result": "1.2.3"
         })));
+    }
+
+    #[test]
+    fn test_logical_size_to_physical_preserves_scaled_widget_dimensions() {
+        assert_eq!(logical_size_to_physical(240, 420, 1.0), (240, 420));
+        assert_eq!(logical_size_to_physical(240, 420, 1.25), (300, 525));
+        assert_eq!(logical_size_to_physical(240, 420, 1.5), (360, 630));
+        assert_eq!(logical_size_to_physical(240, 420, 2.0), (480, 840));
+    }
+
+    #[test]
+    fn test_initialize_without_capabilities_proceeds_to_rate_limit_parsing() {
+        let initialize = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "serverInfo": { "name": "codex" } }
+        });
+        assert!(has_codex_initialize_result(&initialize));
+
+        let rate_limits = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "primary": {
+                            "usedPercent": 42.0,
+                            "resetsAt": 1783951200,
+                            "windowDurationMins": 300
+                        }
+                    }
+                }
+            }
+        });
+        let CodexPollResult::Success { windows } = parse_codex_response(&rate_limits).unwrap()
+        else {
+            panic!("rate-limit response should parse after initialize");
+        };
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].used_pct, 42.0);
+    }
+
+    #[test]
+    fn test_scaled_expansion_clamps_physical_rectangle_at_monitor_edge() {
+        let (width, height) = logical_size_to_physical(240, 420, 1.5);
+        assert_eq!(
+            clamp_window_position(
+                2800,
+                1400,
+                width,
+                height,
+                &Rect {
+                    x: 0,
+                    y: 0,
+                    width: 2880,
+                    height: 1620,
+                }
+            ),
+            (2520, 990)
+        );
     }
 
     #[test]

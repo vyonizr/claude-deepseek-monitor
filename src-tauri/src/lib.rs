@@ -7,7 +7,7 @@ use tauri::{
     image::Image,
     menu::Menu,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindowBuilder,
+    Emitter, LogicalSize, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder,
 };
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_notification::NotificationExt;
@@ -219,17 +219,24 @@ fn resize_widget(app: tauri::AppHandle, width: u32, height: u32) -> Result<(), S
         .ok_or_else(|| "no display monitor is available".to_string())?;
     let monitor_position = monitor.position();
     let monitor_size = monitor.size();
+    let (target_width, target_height) =
+        poll_cycle::logical_size_to_physical(width, height, monitor.scale_factor());
     let monitor_rect = poll_cycle::Rect {
         x: monitor_position.x,
         y: monitor_position.y,
         width: monitor_size.width,
         height: monitor_size.height,
     };
-    let (x, y) =
-        poll_cycle::clamp_window_position(position.x, position.y, width, height, &monitor_rect);
+    let (x, y) = poll_cycle::clamp_window_position(
+        position.x,
+        position.y,
+        target_width,
+        target_height,
+        &monitor_rect,
+    );
 
     window
-        .set_size(PhysicalSize::new(width, height))
+        .set_size(LogicalSize::new(width, height))
         .map_err(|error| error.to_string())?;
     window
         .set_position(PhysicalPosition::new(x, y))
@@ -435,7 +442,7 @@ fn run_codex_command() -> poll_cycle::CodexPollResult {
                 return failure;
             }
         };
-        if !poll_cycle::has_codex_protocol_capabilities(&initialize_response) {
+        if !poll_cycle::has_codex_initialize_result(&initialize_response) {
             let _ = child.kill();
             let _ = child.wait();
             return codex_failure("Codex protocol capability response is incompatible.");

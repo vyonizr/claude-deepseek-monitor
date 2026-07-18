@@ -1,14 +1,16 @@
-# Context: Claude DeepSeek Monitor
+# Context: Claude / Codex / DeepSeek Monitor
 
 ## Domain Language
 
 | Term | Definition |
 |------|------------|
+| Usage source | A coding-agent service whose quota windows are monitored. Claude Code is the core usage source; Codex is an optional source that, when disabled, is neither polled nor displayed. _Avoid_: Provider, agent toggle. |
 | Session window | Claude Code's per-session usage quota. Resets after the session lifetime (~hours). Shown in `/usage` as "Current session: X% used". |
 | Weekly quota | Claude Code's rolling 7-day usage allowance. Resets on a fixed weekly schedule. Shown in `/usage` as "Current week (all models): X% used". |
+| Codex rate-limit window | A Codex usage allowance reported with its percentage used, reset time, and duration. Every available primary and secondary window is displayed and paced independently; labels are derived from duration rather than assumed names. _Avoid_: Codex session, Codex weekly quota. |
 | Pacing | Comparison of % of quota used vs % of time elapsed in the window. Classified as **Underusing** (diff < -under_threshold), **OnPace** (within the configured range), **Overusing** (diff > +over_threshold). Under and Over thresholds are independently configurable (1–20pp, default 1pp each). A special override: if `used_pct >= 100%` before the window ends, pacing is **Overusing** regardless of diff. Rust enum variants serialize to `"under"` / `"onpace"` / `"over"`; `dist/index.html` maps those to the display labels. |
-| Stale | State of the display when the last poll failed to parse `/usage` output. Previous values shown dimmed. |
-| Awaiting session | State of the *session* row specifically when `/usage`'s week line parses successfully but no line starting with `"Current session:"` is present at all (i.e. no session has been started since the last reset). Distinct from Stale: `stale` stays `false`, the widget is not dimmed, `session_used_pct` shows `0`, pacing is suppressed (no ON/UNDER/OVER PACE badge), and the reset-time text reads `"Not started"`. Any messier session-line failure (present but malformed) is still treated as Stale, not Awaiting session. |
+| Source stale | State of one enabled usage source when its latest poll fails. That source retains its previous values dimmed and reports a source-specific diagnostic without affecting other sources. _Avoid_: Stale display, globally stale. |
+| Awaiting session | State of the Claude *session* row specifically when `/usage`'s week line parses successfully but no line starting with `"Current session:"` is present at all (i.e. no session has been started since the last reset). Distinct from Source stale: the Claude source remains fresh, `session_used_pct` shows `0`, pacing is suppressed (no ON/UNDER/OVER PACE badge), and the reset-time text reads `"Not started"`. Any messier session-line failure (present but malformed) makes the Claude source stale instead. |
 | DeepSeek peak window | One of two daily Beijing-time windows (09:00–12:00 and 14:00–18:00 BJT / 01:00–04:00 and 06:00–10:00 UTC) during which DeepSeek charges 2× standard rate. |
 | Poll cycle | A pure function `(raw_usage_text: Option<&str>, current_time, config, previous_state) -> (new_state, notification_events)` — the single unit-testable seam. Accepts `None` for the subprocess-failure case. All app logic lives here. |
 | Imperative shell | The Tauri application layer that spawns subprocesses, reads the clock, fires notifications, and renders the widget. Not unit-tested. |

@@ -46,7 +46,7 @@ impl Default for Config {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct DisplayState {
+pub struct ClaudeState {
     pub session_used_pct: Option<f64>,
     pub session_reset_time_text: Option<String>,
     pub session_pacing: Option<Pacing>,
@@ -54,13 +54,11 @@ pub struct DisplayState {
     pub week_used_pct: Option<f64>,
     pub week_reset_time_text: Option<String>,
     pub week_pacing: Option<Pacing>,
-    pub deepseek_status: DeepSeekStatus,
-    pub next_transition_info: Option<String>,
     pub stale: bool,
     pub diagnostic: Option<String>,
 }
 
-impl Default for DisplayState {
+impl Default for ClaudeState {
     fn default() -> Self {
         Self {
             session_used_pct: None,
@@ -70,10 +68,25 @@ impl Default for DisplayState {
             week_used_pct: None,
             week_reset_time_text: None,
             week_pacing: None,
-            deepseek_status: DeepSeekStatus::OffPeak,
-            next_transition_info: None,
             stale: false,
             diagnostic: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DisplayState {
+    pub claude: ClaudeState,
+    pub deepseek_status: DeepSeekStatus,
+    pub next_transition_info: Option<String>,
+}
+
+impl Default for DisplayState {
+    fn default() -> Self {
+        Self {
+            claude: ClaudeState::default(),
+            deepseek_status: DeepSeekStatus::OffPeak,
+            next_transition_info: None,
         }
     }
 }
@@ -81,7 +94,10 @@ impl Default for DisplayState {
 impl DisplayState {
     pub fn new_diagnostic(msg: impl Into<String>) -> Self {
         Self {
-            diagnostic: Some(msg.into()),
+            claude: ClaudeState {
+                diagnostic: Some(msg.into()),
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -341,10 +357,10 @@ pub fn poll_cycle(
         let session_reset_dt = parse_reset_datetime(&sr, local_offset, current_year);
         let week_reset_dt = parse_reset_datetime(&wr, local_offset, current_year);
 
-        let session_start_str = if previous_state.session_reset_time_text.as_deref() != Some(&sr) {
+        let session_start_str = if previous_state.claude.session_reset_time_text.as_deref() != Some(&sr) {
             session_reset_dt.map(|dt| (dt - Duration::hours(SESSION_WINDOW_HOURS)).to_rfc3339())
         } else {
-            previous_state.session_window_start.clone()
+            previous_state.claude.session_window_start.clone()
         };
 
         let session_window_start = session_start_str.as_ref()
@@ -359,10 +375,10 @@ pub fn poll_cycle(
                     let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
                     Some(compute_pacing(sp, elapsed_pct, config.under_pace_threshold, config.over_pace_threshold))
                 } else {
-                    previous_state.session_pacing.clone()
+                    previous_state.claude.session_pacing.clone()
                 }
             }
-            _ => previous_state.session_pacing.clone(),
+            _ => previous_state.claude.session_pacing.clone(),
         };
 
         let week_pacing = match week_reset_dt {
@@ -375,13 +391,13 @@ pub fn poll_cycle(
                     let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
                     Some(compute_pacing(wp, elapsed_pct, config.under_pace_threshold, config.over_pace_threshold))
                 } else {
-                    previous_state.week_pacing.clone()
+                    previous_state.claude.week_pacing.clone()
                 }
             }
-            _ => previous_state.week_pacing.clone(),
+            _ => previous_state.claude.week_pacing.clone(),
         };
 
-        let display = DisplayState {
+        let claude = ClaudeState {
             session_used_pct: Some(sp),
             session_reset_time_text: Some(sr),
             session_pacing,
@@ -392,7 +408,10 @@ pub fn poll_cycle(
             ..Default::default()
         };
 
-        (display, true)
+        (DisplayState {
+            claude,
+            ..Default::default()
+        }, true)
     } else if awaiting_session {
         let (wp, wr) = parsed.as_ref().and_then(|p| p.week.clone()).expect("awaiting_session implies week is Some");
         let local_offset = *current_time.offset();
@@ -409,13 +428,13 @@ pub fn poll_cycle(
                     let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
                     Some(compute_pacing(wp, elapsed_pct, config.under_pace_threshold, config.over_pace_threshold))
                 } else {
-                    previous_state.week_pacing.clone()
+                    previous_state.claude.week_pacing.clone()
                 }
             }
-            _ => previous_state.week_pacing.clone(),
+            _ => previous_state.claude.week_pacing.clone(),
         };
 
-        let display = DisplayState {
+        let claude = ClaudeState {
             session_used_pct: Some(0.0),
             session_reset_time_text: Some("Not started".to_string()),
             session_pacing: None,
@@ -426,18 +445,21 @@ pub fn poll_cycle(
             ..Default::default()
         };
 
-        (display, true)
+        (DisplayState {
+            claude,
+            ..Default::default()
+        }, true)
     } else {
         let mut display = previous_state.clone();
-        display.stale = raw_usage_text.is_some();
+        display.claude.stale = raw_usage_text.is_some();
         // carry diagnostic forward instead of clearing it
         (display, false)
     };
 
     if usage_ok {
-        display.stale = false;
+        display.claude.stale = false;
     } else if raw_usage_text.is_none() {
-        display.stale = true;
+        display.claude.stale = true;
     }
 
     let (ds_status, ds_info) = compute_deepseek_status(current_time, config);
@@ -556,20 +578,23 @@ mod tests {
         let now = make_time(14, 0, 0);
         let config = Config::default();
         let prev = DisplayState {
+            claude: ClaudeState {
             session_used_pct: Some(8.0),
             session_reset_time_text: Some("Jul 13, 8:40pm (Asia/Jakarta)".into()),
             week_used_pct: Some(10.0),
             week_reset_time_text: Some("Jul 18, 4am (Asia/Jakarta)".into()),
             ..Default::default()
+            },
+            ..Default::default()
         };
 
         let (display, _events) = poll_cycle(Some(WEEK_ONLY_USAGE_TEXT), &now, &config, &prev);
 
-        assert!(!display.stale, "awaiting session should not be treated as stale");
-        assert_eq!(display.session_used_pct, Some(0.0));
-        assert_eq!(display.session_reset_time_text, Some("Not started".to_string()));
-        assert_eq!(display.session_pacing, None, "no pacing badge while awaiting a session");
-        assert_eq!(display.week_used_pct, Some(13.0), "week should keep updating normally");
+        assert!(!display.claude.stale, "awaiting session should not be treated as stale");
+        assert_eq!(display.claude.session_used_pct, Some(0.0));
+        assert_eq!(display.claude.session_reset_time_text, Some("Not started".to_string()));
+        assert_eq!(display.claude.session_pacing, None, "no pacing badge while awaiting a session");
+        assert_eq!(display.claude.week_used_pct, Some(13.0), "week should keep updating normally");
     }
 
     #[test]
@@ -577,10 +602,14 @@ mod tests {
         let now = make_time(14, 0, 0);
         let config = Config::default();
         let prev = DisplayState {
+            claude: ClaudeState {
             session_used_pct: Some(8.0),
             session_reset_time_text: Some("Jul 13, 8:40pm (Asia/Jakarta)".into()),
             week_used_pct: Some(10.0),
             week_reset_time_text: Some("Jul 18, 4am (Asia/Jakarta)".into()),
+            diagnostic: Some("previous diagnostic".into()),
+            ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -590,8 +619,10 @@ mod tests {
 
         let (display, _events) = poll_cycle(Some(text), &now, &config, &prev);
 
-        assert!(display.stale, "malformed session line should remain Stale, not Awaiting session");
-        assert_eq!(display.session_used_pct, Some(8.0), "previous value carried forward while stale");
+        assert!(display.claude.stale, "malformed session line should remain Stale, not Awaiting session");
+        assert_eq!(display.claude.session_used_pct, Some(8.0), "previous value carried forward while stale");
+        assert_eq!(display.claude.diagnostic.as_deref(), Some("previous diagnostic"));
+        assert!(matches!(display.deepseek_status, DeepSeekStatus::Peak { .. }), "DeepSeek should remain independently computed");
     }
 
     #[test]
@@ -602,10 +633,10 @@ mod tests {
 
         let (display, _events) = poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev);
 
-        assert!(!display.stale);
-        assert_eq!(display.session_used_pct, Some(8.0));
-        assert_eq!(display.week_used_pct, Some(13.0));
-        assert!(display.session_reset_time_text.unwrap().contains("Jul 13, 8:40pm"));
+        assert!(!display.claude.stale);
+        assert_eq!(display.claude.session_used_pct, Some(8.0));
+        assert_eq!(display.claude.week_used_pct, Some(13.0));
+        assert!(display.claude.session_reset_time_text.unwrap().contains("Jul 13, 8:40pm"));
     }
 
     #[test]
@@ -616,8 +647,8 @@ mod tests {
 
         let (display, _events) = poll_cycle(None, &now, &config, &prev);
 
-        assert!(display.stale);
-        assert_eq!(display.session_used_pct, None);
+        assert!(display.claude.stale);
+        assert_eq!(display.claude.session_used_pct, None);
     }
 
     #[test]
@@ -625,18 +656,21 @@ mod tests {
         let now = make_time(14, 0, 0);
         let config = Config::default();
         let prev = DisplayState {
+            claude: ClaudeState {
             session_used_pct: Some(8.0),
             session_reset_time_text: Some("Jul 13, 8:40pm (Asia/Jakarta)".into()),
             week_used_pct: Some(13.0),
             week_reset_time_text: Some("Jul 18, 4am (Asia/Jakarta)".into()),
             ..Default::default()
+            },
+            ..Default::default()
         };
 
         let (display, _events) = poll_cycle(Some("garbage malformed text"), &now, &config, &prev);
 
-        assert!(display.stale);
-        assert_eq!(display.session_used_pct, Some(8.0));
-        assert_eq!(display.week_used_pct, Some(13.0));
+        assert!(display.claude.stale);
+        assert_eq!(display.claude.session_used_pct, Some(8.0));
+        assert_eq!(display.claude.week_used_pct, Some(13.0));
     }
 
     #[test]

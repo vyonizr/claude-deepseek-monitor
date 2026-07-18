@@ -107,18 +107,19 @@ fn settings_to_config(settings: &SavedSettings) -> poll_cycle::Config {
 }
 
 fn to_json(state: &poll_cycle::DisplayState, app: &tauri::AppHandle) -> serde_json::Value {
+    let claude = &state.claude;
     let opacity = load_settings(app).widget_opacity;
     serde_json::json!({
-        "session_pct": state.session_used_pct.map(|v| format!("{:.0}%", v)),
-        "session_reset": state.session_reset_time_text,
-        "session_pacing": state.session_pacing.as_ref().map(|p| match p {
+        "session_pct": claude.session_used_pct.map(|v| format!("{:.0}%", v)),
+        "session_reset": claude.session_reset_time_text,
+        "session_pacing": claude.session_pacing.as_ref().map(|p| match p {
             poll_cycle::Pacing::Underusing => "under",
             poll_cycle::Pacing::OnPace => "onpace",
             poll_cycle::Pacing::Overusing => "over",
         }),
-        "week_pct": state.week_used_pct.map(|v| format!("{:.0}%", v)),
-        "week_reset": state.week_reset_time_text,
-        "week_pacing": state.week_pacing.as_ref().map(|p| match p {
+        "week_pct": claude.week_used_pct.map(|v| format!("{:.0}%", v)),
+        "week_reset": claude.week_reset_time_text,
+        "week_pacing": claude.week_pacing.as_ref().map(|p| match p {
             poll_cycle::Pacing::Underusing => "under",
             poll_cycle::Pacing::OnPace => "onpace",
             poll_cycle::Pacing::Overusing => "over",
@@ -129,8 +130,8 @@ fn to_json(state: &poll_cycle::DisplayState, app: &tauri::AppHandle) -> serde_js
             _ => None,
         },
         "next_transition": state.next_transition_info,
-        "stale": state.stale,
-        "diagnostic": state.diagnostic,
+        "stale": claude.stale,
+        "diagnostic": claude.diagnostic,
         "widget_opacity": opacity,
     })
 }
@@ -263,11 +264,11 @@ fn run_poll_cycle(app: &tauri::AppHandle) -> bool {
         );
 
         eprintln!("[monitor] poll_cycle done, events={}, stale={}, session_pct={:?}, week_pct={:?}",
-            events.len(), new_state.stale, new_state.session_used_pct, new_state.week_used_pct);
+            events.len(), new_state.claude.stale, new_state.claude.session_used_pct, new_state.claude.week_used_pct);
 
         let parse_failed = raw_text.is_some()
-            && new_state.stale
-            && new_state.session_used_pct.is_none();
+            && new_state.claude.stale
+            && new_state.claude.session_used_pct.is_none();
 
         if parse_failed && attempt < MAX_ATTEMPTS {
             eprintln!("[monitor] parse failed on attempt {attempt}, retrying claude command");
@@ -280,18 +281,18 @@ fn run_poll_cycle(app: &tauri::AppHandle) -> bool {
 
     // If the subprocess ran but parsing failed, show the raw output as diagnostic
     if let Some(ref text) = raw_text {
-        if new_state.stale && new_state.session_used_pct.is_none() {
+        if new_state.claude.stale && new_state.claude.session_used_pct.is_none() {
             let preview: String = text.chars().take(200).collect();
             eprintln!("[monitor] PARSE FAILED. Raw output (200 chars):\n---\n{preview}\n---");
-            new_state.diagnostic = Some(format!("Unexpected output: {preview}"));
+            new_state.claude.diagnostic = Some(format!("Unexpected output: {preview}"));
         }
     }
 
     if let Some(diag) = cmd_diagnostic {
-        new_state.diagnostic = Some(diag);
+        new_state.claude.diagnostic = Some(diag);
     }
 
-    let succeeded = new_state.diagnostic.is_none();
+    let succeeded = new_state.claude.diagnostic.is_none();
     state_lock.consecutive_failures = if succeeded {
         0
     } else {

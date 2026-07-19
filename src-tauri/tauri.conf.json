@@ -10,11 +10,12 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Monitor",
+        "title": "Claude / Codex / DeepSeek Monitor",
         "width": 240,
         "height": 185,
         "resizable": false,
         "decorations": false,
+        "transparent": true,
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "visible": true

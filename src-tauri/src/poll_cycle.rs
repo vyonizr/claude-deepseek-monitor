@@ -28,21 +28,32 @@ pub struct DeepSeekWindow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub deepseek_windows: Vec<DeepSeekWindow>,
+    pub under_pace_threshold: f64,
+    pub over_pace_threshold: f64,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             deepseek_windows: vec![
-                DeepSeekWindow { start_hour: 9, end_hour: 12 },
-                DeepSeekWindow { start_hour: 14, end_hour: 18 },
+                DeepSeekWindow {
+                    start_hour: 9,
+                    end_hour: 12,
+                },
+                DeepSeekWindow {
+                    start_hour: 14,
+                    end_hour: 18,
+                },
             ],
+            under_pace_threshold: 1.0,
+            over_pace_threshold: 1.0,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct DisplayState {
+pub struct ClaudeState {
+    pub enabled: bool,
     pub session_used_pct: Option<f64>,
     pub session_reset_time_text: Option<String>,
     pub session_pacing: Option<Pacing>,
@@ -50,15 +61,170 @@ pub struct DisplayState {
     pub week_used_pct: Option<f64>,
     pub week_reset_time_text: Option<String>,
     pub week_pacing: Option<Pacing>,
-    pub deepseek_status: DeepSeekStatus,
-    pub next_transition_info: Option<String>,
     pub stale: bool,
     pub diagnostic: Option<String>,
 }
 
-impl Default for DisplayState {
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodexWindowState {
+    pub label: String,
+    pub used_pct: f64,
+    pub reset_time_text: Option<String>,
+    pub pacing: Option<Pacing>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodexState {
+    pub enabled: bool,
+    pub loading: bool,
+    pub available: bool,
+    pub stale: bool,
+    pub diagnostic: Option<String>,
+    pub primary: Option<CodexWindowState>,
+    pub windows: Vec<CodexWindowState>,
+}
+
+impl Default for CodexState {
     fn default() -> Self {
         Self {
+            enabled: false,
+            loading: false,
+            available: false,
+            stale: false,
+            diagnostic: None,
+            primary: None,
+            windows: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CodexPollResult {
+    Success { windows: Vec<CodexPollWindow> },
+    Failure { diagnostic: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodexPollWindow {
+    pub kind: CodexWindowKind,
+    pub used_pct: f64,
+    pub reset_at: Option<chrono::DateTime<FixedOffset>>,
+    pub reset_time_text: Option<String>,
+    pub window_duration_mins: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CodexWindowKind {
+    Primary,
+    Secondary,
+}
+
+pub fn codex_failure_diagnostic(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("login") || lower.contains("auth") {
+        "Codex login required: run `codex login`.".into()
+    } else if lower.contains("method not found")
+        || lower.contains("unknown method")
+        || lower.contains("protocol")
+        || lower.contains("compatible snapshot")
+        || lower.contains("usable windows")
+        || lower.contains("missing rate-limit")
+        || lower.contains("missing usedpercent")
+    {
+        "Codex CLI update required for rate-limit monitoring.".into()
+    } else {
+        "Codex rate-limit poll failed.".into()
+    }
+}
+
+/// A successful initialize response is enough to attempt the rate-limit
+/// request. Codex has changed the shape of its advertised capabilities across
+/// CLI releases, so the rate-limit response is the authoritative compatibility
+/// check rather than a particular `result.capabilities` object shape.
+pub fn has_codex_initialize_result(response: &serde_json::Value) -> bool {
+    response
+        .get("result")
+        .map(serde_json::Value::is_object)
+        .unwrap_or(false)
+}
+
+pub fn logical_size_to_physical(width: u32, height: u32, scale_factor: f64) -> (u32, u32) {
+    let scale_factor = scale_factor.max(0.01);
+    (
+        ((width as f64) * scale_factor).round().max(1.0) as u32,
+        ((height as f64) * scale_factor).round().max(1.0) as u32,
+    )
+}
+
+/// Parse the current and legacy app-server response shapes into the pure
+/// poll-cycle model. Only the named Codex group and its primary/secondary
+/// windows are relevant; controls such as credits are deliberately ignored.
+pub fn parse_codex_response(response: &serde_json::Value) -> Result<CodexPollResult, String> {
+    let result = response
+        .get("result")
+        .ok_or_else(|| "missing rate-limit response".to_string())?;
+    let snapshot = result
+        .get("rateLimitsByLimitId")
+        .and_then(|groups| groups.get("codex"))
+        .filter(|snapshot| !snapshot.is_null())
+        .or_else(|| result.get("rateLimits"))
+        .ok_or_else(|| "rate-limit response has no compatible snapshot".to_string())?;
+    let mut windows = Vec::new();
+    for (kind, names) in [
+        (CodexWindowKind::Primary, ["primary", "primaryWindow"]),
+        (CodexWindowKind::Secondary, ["secondary", "secondaryWindow"]),
+    ] {
+        if let Some(window) = names.iter().find_map(|name| snapshot.get(name)) {
+            if window.is_null() {
+                continue;
+            }
+            let name = if kind == CodexWindowKind::Primary {
+                "primary"
+            } else {
+                "secondary"
+            };
+            let used_pct = window
+                .get("usedPercent")
+                .or_else(|| window.get("used_percent"))
+                .and_then(|value| value.as_f64())
+                .ok_or_else(|| format!("{name} rate-limit window is missing usedPercent"))?;
+            let window_duration_mins = window
+                .get("windowDurationMins")
+                .or_else(|| window.get("window_duration_mins"))
+                .and_then(|value| value.as_i64());
+            let reset_value = window.get("resetsAt").or_else(|| window.get("resets_at"));
+            let reset_at = reset_value
+                .and_then(|value| value.as_i64())
+                .and_then(|seconds| DateTime::<chrono::Utc>::from_timestamp(seconds, 0))
+                .map(|date| date.with_timezone(&FixedOffset::east_opt(0).unwrap()))
+                .or_else(|| {
+                    reset_value
+                        .and_then(|value| value.as_str())
+                        .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+                });
+            let reset_time_text = reset_value
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+                .or_else(|| reset_at.as_ref().map(DateTime::to_rfc3339));
+            windows.push(CodexPollWindow {
+                kind,
+                used_pct,
+                reset_at,
+                reset_time_text,
+                window_duration_mins,
+            });
+        }
+    }
+    if windows.is_empty() {
+        return Err("rate-limit response has no usable windows".into());
+    }
+    Ok(CodexPollResult::Success { windows })
+}
+
+impl Default for ClaudeState {
+    fn default() -> Self {
+        Self {
+            enabled: true,
             session_used_pct: None,
             session_reset_time_text: None,
             session_pacing: None,
@@ -66,10 +232,27 @@ impl Default for DisplayState {
             week_used_pct: None,
             week_reset_time_text: None,
             week_pacing: None,
-            deepseek_status: DeepSeekStatus::OffPeak,
-            next_transition_info: None,
             stale: false,
             diagnostic: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DisplayState {
+    pub claude: ClaudeState,
+    pub codex: CodexState,
+    pub deepseek_status: DeepSeekStatus,
+    pub next_transition_info: Option<String>,
+}
+
+impl Default for DisplayState {
+    fn default() -> Self {
+        Self {
+            claude: ClaudeState::default(),
+            codex: CodexState::default(),
+            deepseek_status: DeepSeekStatus::OffPeak,
+            next_transition_info: None,
         }
     }
 }
@@ -77,13 +260,15 @@ impl Default for DisplayState {
 impl DisplayState {
     pub fn new_diagnostic(msg: impl Into<String>) -> Self {
         Self {
-            diagnostic: Some(msg.into()),
+            claude: ClaudeState {
+                diagnostic: Some(msg.into()),
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
 }
 
-const PACING_THRESHOLD: f64 = 1.0;
 const SESSION_WINDOW_HOURS: i64 = 5;
 
 /// Session and week lines are parsed independently so a missing/malformed
@@ -147,10 +332,18 @@ fn extract_percentage(line: &str) -> Option<f64> {
 fn extract_reset_time(line: &str) -> Option<String> {
     let after_resets = line.split("resets ").nth(1)?;
     let trimmed = after_resets.trim().to_string();
-    if trimmed.is_empty() { None } else { Some(trimmed) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
-fn parse_reset_datetime(reset_text: &str, local_offset: FixedOffset, current_year: i32) -> Option<DateTime<FixedOffset>> {
+fn parse_reset_datetime(
+    reset_text: &str,
+    local_offset: FixedOffset,
+    current_year: i32,
+) -> Option<DateTime<FixedOffset>> {
     let without_tz = reset_text.split(" (").next()?;
     let clean = without_tz.trim();
 
@@ -160,10 +353,8 @@ fn parse_reset_datetime(reset_text: &str, local_offset: FixedOffset, current_yea
         (&clean[..comma], clean[comma + 1..].trim())
     };
 
-    let naive_date = NaiveDate::parse_from_str(
-        &format!("{} {}", date_str, current_year),
-        "%b %d %Y",
-    ).ok()?;
+    let naive_date =
+        NaiveDate::parse_from_str(&format!("{} {}", date_str, current_year), "%b %d %Y").ok()?;
 
     // Time part may be like "4am", "4:40pm", "8:40pm", "4:00am"
     let time_lower = time_str.to_lowercase();
@@ -183,22 +374,31 @@ fn parse_reset_datetime(reset_text: &str, local_offset: FixedOffset, current_yea
         (h, 0)
     };
 
-    let hour_24 = if is_pm && hour != 12 { hour + 12 }
-        else if !is_pm && hour == 12 { 0 }
-        else { hour };
+    let hour_24 = if is_pm && hour != 12 {
+        hour + 12
+    } else if !is_pm && hour == 12 {
+        0
+    } else {
+        hour
+    };
 
     let naive = naive_date.and_hms_opt(hour_24, minute, 0)?;
     naive.and_local_timezone(local_offset).single()
 }
 
-fn compute_pacing(used_pct: f64, elapsed_pct: f64) -> Pacing {
+fn compute_pacing(
+    used_pct: f64,
+    elapsed_pct: f64,
+    under_threshold: f64,
+    over_threshold: f64,
+) -> Pacing {
     if used_pct >= 100.0 && elapsed_pct < 100.0 {
         return Pacing::Overusing;
     }
     let diff = used_pct - elapsed_pct;
-    if diff < -PACING_THRESHOLD {
+    if diff < -under_threshold {
         Pacing::Underusing
-    } else if diff > PACING_THRESHOLD {
+    } else if diff > over_threshold {
         Pacing::Overusing
     } else {
         Pacing::OnPace
@@ -243,7 +443,10 @@ pub fn deepseek_window_label(window: &DeepSeekWindow) -> String {
     format!("{:02}:00–{:02}:00 BJT", window.start_hour, window.end_hour)
 }
 
-fn time_until_next_transition(bj_dt: &DateTime<FixedOffset>, config: &Config) -> Option<(String, bool)> {
+fn time_until_next_transition(
+    bj_dt: &DateTime<FixedOffset>,
+    config: &Config,
+) -> Option<(String, bool)> {
     let bj_hour = bj_dt.hour();
     let bj_minute = bj_dt.minute();
 
@@ -297,18 +500,14 @@ fn compute_deepseek_status(
         )
     } else {
         match time_until_next_transition(&bj_time, config) {
-            Some((info, true)) => {
-                (
-                    DeepSeekStatus::OffPeak,
-                    Some(format!("Next peak in {}", info)),
-                )
-            }
-            Some((info, false)) => {
-                (
-                    DeepSeekStatus::OffPeak,
-                    Some(format!("Off-peak until {}", info)),
-                )
-            }
+            Some((info, true)) => (
+                DeepSeekStatus::OffPeak,
+                Some(format!("Next peak in {}", info)),
+            ),
+            Some((info, false)) => (
+                DeepSeekStatus::OffPeak,
+                Some(format!("Off-peak until {}", info)),
+            ),
             None => (DeepSeekStatus::OffPeak, None),
         }
     }
@@ -319,123 +518,182 @@ pub fn poll_cycle(
     current_time: &DateTime<FixedOffset>,
     config: &Config,
     previous_state: &DisplayState,
+    claude_enabled: bool,
+    codex_enabled: bool,
+    codex_result: Option<&CodexPollResult>,
 ) -> (DisplayState, Vec<NotificationEvent>) {
-    let parsed = raw_usage_text.map(parse_usage_sections);
-
-    let awaiting_session = matches!(
-        &parsed,
-        Some(p) if p.week.is_some() && p.session.is_none() && !p.session_line_present
-    );
-
-    let full = parsed.as_ref().and_then(|p| match (&p.session, &p.week) {
-        (Some((sp, sr)), Some((wp, wr))) => Some((*sp, sr.clone(), *wp, wr.clone())),
-        _ => None,
-    });
-
-    let (mut display, usage_ok) = if let Some((sp, sr, wp, wr)) = full {
-        let local_offset = *current_time.offset();
-        let current_year = current_time.year();
-        let session_reset_dt = parse_reset_datetime(&sr, local_offset, current_year);
-        let week_reset_dt = parse_reset_datetime(&wr, local_offset, current_year);
-
-        let session_start_str = if previous_state.session_reset_time_text.as_deref() != Some(&sr) {
-            session_reset_dt.map(|dt| (dt - Duration::hours(SESSION_WINDOW_HOURS)).to_rfc3339())
-        } else {
-            previous_state.session_window_start.clone()
-        };
-
-        let session_window_start = session_start_str.as_ref()
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok());
-
-        let session_pacing = match (session_window_start, session_reset_dt) {
-            (Some(start), Some(reset)) if start < reset => {
-                let total_dur = reset - start;
-                let elapsed = *current_time - start;
-                if total_dur.num_seconds() > 0 {
-                    let elapsed_pct = (elapsed.num_seconds() as f64 / total_dur.num_seconds() as f64) * 100.0;
-                    let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
-                    Some(compute_pacing(sp, elapsed_pct))
-                } else {
-                    previous_state.session_pacing.clone()
-                }
-            }
-            _ => previous_state.session_pacing.clone(),
-        };
-
-        let week_pacing = match week_reset_dt {
-            Some(reset) => {
-                let window_start = reset - Duration::days(7);
-                let total_dur = reset - window_start;
-                let elapsed = *current_time - window_start;
-                if total_dur.num_seconds() > 0 {
-                    let elapsed_pct = (elapsed.num_seconds() as f64 / total_dur.num_seconds() as f64) * 100.0;
-                    let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
-                    Some(compute_pacing(wp, elapsed_pct))
-                } else {
-                    previous_state.week_pacing.clone()
-                }
-            }
-            _ => previous_state.week_pacing.clone(),
-        };
-
-        let display = DisplayState {
-            session_used_pct: Some(sp),
-            session_reset_time_text: Some(sr),
-            session_pacing,
-            session_window_start: session_start_str,
-            week_used_pct: Some(wp),
-            week_reset_time_text: Some(wr),
-            week_pacing,
-            ..Default::default()
-        };
-
-        (display, true)
-    } else if awaiting_session {
-        let (wp, wr) = parsed.as_ref().and_then(|p| p.week.clone()).expect("awaiting_session implies week is Some");
-        let local_offset = *current_time.offset();
-        let current_year = current_time.year();
-        let week_reset_dt = parse_reset_datetime(&wr, local_offset, current_year);
-
-        let week_pacing = match week_reset_dt {
-            Some(reset) => {
-                let window_start = reset - Duration::days(7);
-                let total_dur = reset - window_start;
-                let elapsed = *current_time - window_start;
-                if total_dur.num_seconds() > 0 {
-                    let elapsed_pct = (elapsed.num_seconds() as f64 / total_dur.num_seconds() as f64) * 100.0;
-                    let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
-                    Some(compute_pacing(wp, elapsed_pct))
-                } else {
-                    previous_state.week_pacing.clone()
-                }
-            }
-            _ => previous_state.week_pacing.clone(),
-        };
-
-        let display = DisplayState {
-            session_used_pct: Some(0.0),
-            session_reset_time_text: Some("Not started".to_string()),
-            session_pacing: None,
-            session_window_start: None,
-            week_used_pct: Some(wp),
-            week_reset_time_text: Some(wr),
-            week_pacing,
-            ..Default::default()
-        };
-
-        (display, true)
-    } else {
+    let (mut display, usage_ok) = if !claude_enabled {
         let mut display = previous_state.clone();
-        display.stale = raw_usage_text.is_some();
-        // carry diagnostic forward instead of clearing it
+        display.claude = ClaudeState {
+            enabled: false,
+            ..Default::default()
+        };
         (display, false)
+    } else {
+        let parsed = raw_usage_text.map(parse_usage_sections);
+
+        let awaiting_session = matches!(
+            &parsed,
+            Some(p) if p.week.is_some() && p.session.is_none() && !p.session_line_present
+        );
+
+        let full = parsed.as_ref().and_then(|p| match (&p.session, &p.week) {
+            (Some((sp, sr)), Some((wp, wr))) => Some((*sp, sr.clone(), *wp, wr.clone())),
+            _ => None,
+        });
+
+        if let Some((sp, sr, wp, wr)) = full {
+            let local_offset = *current_time.offset();
+            let current_year = current_time.year();
+            let session_reset_dt = parse_reset_datetime(&sr, local_offset, current_year);
+            let week_reset_dt = parse_reset_datetime(&wr, local_offset, current_year);
+
+            let session_start_str =
+                if previous_state.claude.session_reset_time_text.as_deref() != Some(&sr) {
+                    session_reset_dt.map(|dt| (dt - Duration::hours(SESSION_WINDOW_HOURS)).to_rfc3339())
+                } else {
+                    previous_state.claude.session_window_start.clone()
+                };
+
+            let session_window_start = session_start_str
+                .as_ref()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok());
+
+            let session_pacing = match (session_window_start, session_reset_dt) {
+                (Some(start), Some(reset)) if start < reset => {
+                    let total_dur = reset - start;
+                    let elapsed = *current_time - start;
+                    if total_dur.num_seconds() > 0 {
+                        let elapsed_pct =
+                            (elapsed.num_seconds() as f64 / total_dur.num_seconds() as f64) * 100.0;
+                        let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
+                        Some(compute_pacing(
+                            sp,
+                            elapsed_pct,
+                            config.under_pace_threshold,
+                            config.over_pace_threshold,
+                        ))
+                    } else {
+                        previous_state.claude.session_pacing.clone()
+                    }
+                }
+                _ => previous_state.claude.session_pacing.clone(),
+            };
+
+            let week_pacing = match week_reset_dt {
+                Some(reset) => {
+                    let window_start = reset - Duration::days(7);
+                    let total_dur = reset - window_start;
+                    let elapsed = *current_time - window_start;
+                    if total_dur.num_seconds() > 0 {
+                        let elapsed_pct =
+                            (elapsed.num_seconds() as f64 / total_dur.num_seconds() as f64) * 100.0;
+                        let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
+                        Some(compute_pacing(
+                            wp,
+                            elapsed_pct,
+                            config.under_pace_threshold,
+                            config.over_pace_threshold,
+                        ))
+                    } else {
+                        previous_state.claude.week_pacing.clone()
+                    }
+                }
+                _ => previous_state.claude.week_pacing.clone(),
+            };
+
+            let claude = ClaudeState {
+                enabled: true,
+                session_used_pct: Some(sp),
+                session_reset_time_text: Some(sr),
+                session_pacing,
+                session_window_start: session_start_str,
+                week_used_pct: Some(wp),
+                week_reset_time_text: Some(wr),
+                week_pacing,
+                ..Default::default()
+            };
+
+            (
+                DisplayState {
+                    claude,
+                    ..Default::default()
+                },
+                true,
+            )
+        } else if awaiting_session {
+            let (wp, wr) = parsed
+                .as_ref()
+                .and_then(|p| p.week.clone())
+                .expect("awaiting_session implies week is Some");
+            let local_offset = *current_time.offset();
+            let current_year = current_time.year();
+            let week_reset_dt = parse_reset_datetime(&wr, local_offset, current_year);
+
+            let week_pacing = match week_reset_dt {
+                Some(reset) => {
+                    let window_start = reset - Duration::days(7);
+                    let total_dur = reset - window_start;
+                    let elapsed = *current_time - window_start;
+                    if total_dur.num_seconds() > 0 {
+                        let elapsed_pct =
+                            (elapsed.num_seconds() as f64 / total_dur.num_seconds() as f64) * 100.0;
+                        let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
+                        Some(compute_pacing(
+                            wp,
+                            elapsed_pct,
+                            config.under_pace_threshold,
+                            config.over_pace_threshold,
+                        ))
+                    } else {
+                        previous_state.claude.week_pacing.clone()
+                    }
+                }
+                _ => previous_state.claude.week_pacing.clone(),
+            };
+
+            let claude = ClaudeState {
+                enabled: true,
+                session_used_pct: Some(0.0),
+                session_reset_time_text: Some("Not started".to_string()),
+                session_pacing: None,
+                session_window_start: None,
+                week_used_pct: Some(wp),
+                week_reset_time_text: Some(wr),
+                week_pacing,
+                ..Default::default()
+            };
+
+            (
+                DisplayState {
+                    claude,
+                    ..Default::default()
+                },
+                true,
+            )
+        } else {
+            let mut display = previous_state.clone();
+            display.claude.stale = raw_usage_text.is_some();
+            // carry diagnostic forward instead of clearing it
+            (display, false)
+        }
     };
 
-    if usage_ok {
-        display.stale = false;
-    } else if raw_usage_text.is_none() {
-        display.stale = true;
+    if claude_enabled {
+        if usage_ok {
+            display.claude.stale = false;
+        } else if raw_usage_text.is_none() {
+            display.claude.stale = true;
+        }
     }
+
+    display.codex = update_codex_state(
+        codex_enabled,
+        codex_result,
+        current_time,
+        config,
+        &previous_state.codex,
+    );
 
     let (ds_status, ds_info) = compute_deepseek_status(current_time, config);
     display.deepseek_status = ds_status.clone();
@@ -456,6 +714,151 @@ pub fn poll_cycle(
     }
 
     (display, events)
+}
+
+fn update_codex_state(
+    enabled: bool,
+    result: Option<&CodexPollResult>,
+    current_time: &DateTime<FixedOffset>,
+    config: &Config,
+    previous: &CodexState,
+) -> CodexState {
+    if !enabled {
+        return CodexState::default();
+    }
+
+    let Some(result) = result else {
+        let mut state = previous.clone();
+        state.enabled = true;
+        state.loading = true;
+        return state;
+    };
+
+    match result {
+        CodexPollResult::Failure { diagnostic } => CodexState {
+            enabled: true,
+            loading: false,
+            available: previous.available,
+            stale: previous.available,
+            diagnostic: Some(diagnostic.clone()),
+            primary: previous.primary.clone(),
+            windows: previous.windows.clone(),
+        },
+        CodexPollResult::Success { windows } => {
+            let primary_index = windows
+                .iter()
+                .position(|window| window.kind == CodexWindowKind::Primary);
+            let windows = windows
+                .iter()
+                .map(|window| {
+                    let pacing = match (window.reset_at, window.window_duration_mins) {
+                        (Some(reset), Some(duration)) if duration > 0 => {
+                            let start = reset - Duration::minutes(duration);
+                            let total = reset - start;
+                            let elapsed = (*current_time - start).num_seconds() as f64;
+                            let elapsed_pct = if total.num_seconds() > 0 {
+                                (elapsed / total.num_seconds() as f64 * 100.0).clamp(0.0, 100.0)
+                            } else {
+                                return CodexWindowState {
+                                    label: window_label(window),
+                                    used_pct: window.used_pct,
+                                    reset_time_text: window.reset_time_text.clone(),
+                                    pacing: None,
+                                };
+                            };
+                            Some(compute_pacing(
+                                window.used_pct,
+                                elapsed_pct,
+                                config.under_pace_threshold,
+                                config.over_pace_threshold,
+                            ))
+                        }
+                        _ => None,
+                    };
+                    CodexWindowState {
+                        label: window_label(window),
+                        used_pct: window.used_pct,
+                        reset_time_text: window.reset_time_text.clone(),
+                        pacing,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let primary = primary_index.and_then(|index| windows.get(index).cloned());
+            CodexState {
+                enabled: true,
+                loading: false,
+                available: true,
+                stale: false,
+                diagnostic: None,
+                primary,
+                windows,
+            }
+        }
+    }
+}
+
+fn window_label(window: &CodexPollWindow) -> String {
+    window
+        .window_duration_mins
+        .map(codex_duration_label)
+        .unwrap_or_else(|| match window.kind {
+            CodexWindowKind::Primary => "Primary".into(),
+            CodexWindowKind::Secondary => "Secondary".into(),
+        })
+}
+
+pub fn codex_duration_label(minutes: i64) -> String {
+    if minutes % (24 * 60) == 0 {
+        let days = minutes / (24 * 60);
+        format!("{}-day", days)
+    } else if minutes % 60 == 0 {
+        let hours = minutes / 60;
+        format!("{}-hour", hours)
+    } else {
+        format!("{}-minute", minutes)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+pub fn is_position_visible(window_rect: &Rect, monitor_rects: &[Rect]) -> bool {
+    monitor_rects.iter().any(|m| rects_overlap(window_rect, m))
+}
+
+pub fn clamp_window_position(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    monitor: &Rect,
+) -> (i32, i32) {
+    let max_x = monitor
+        .x
+        .saturating_add(monitor.width as i32)
+        .saturating_sub(width as i32);
+    let max_y = monitor
+        .y
+        .saturating_add(monitor.height as i32)
+        .saturating_sub(height as i32);
+    (
+        x.clamp(monitor.x, max_x.max(monitor.x)),
+        y.clamp(monitor.y, max_y.max(monitor.y)),
+    )
+}
+
+fn rects_overlap(a: &Rect, b: &Rect) -> bool {
+    let a_x2 = a.x.saturating_add(a.width as i32);
+    let a_y2 = a.y.saturating_add(a.height as i32);
+    let b_x2 = b.x.saturating_add(b.width as i32);
+    let b_y2 = b.y.saturating_add(b.height as i32);
+
+    a.x < b_x2 && a_x2 > b.x && a.y < b_y2 && a_y2 > b.y
 }
 
 #[cfg(test)]
@@ -503,8 +906,14 @@ mod tests {
         assert!(result.is_some(), "should parse despite Fable line");
         let (sp, sr, wp, wr) = result.unwrap();
         assert_eq!(sp, 3.0, "session pct should be 3, got {sp}");
-        assert_eq!(wp, 14.0, "week pct should be 14 (all models), got {wp} — Fable line overwrote it");
-        assert!(wr.contains("Jul 18"), "week reset should be Jul 18, got '{wr}'");
+        assert_eq!(
+            wp, 14.0,
+            "week pct should be 14 (all models), got {wp} — Fable line overwrote it"
+        );
+        assert!(
+            wr.contains("Jul 18"),
+            "week reset should be Jul 18, got '{wr}'"
+        );
     }
 
     #[test]
@@ -515,7 +924,9 @@ mod tests {
 
     #[test]
     fn test_parse_partial_text_returns_none() {
-        let result = parse_claude_usage_text("Current session: 8% used \u{00b7} resets Jul 13, 8:40pm (Asia/Jakarta)");
+        let result = parse_claude_usage_text(
+            "Current session: 8% used \u{00b7} resets Jul 13, 8:40pm (Asia/Jakarta)",
+        );
         assert!(result.is_none());
     }
 
@@ -532,20 +943,44 @@ mod tests {
         let now = make_time(14, 0, 0);
         let config = Config::default();
         let prev = DisplayState {
-            session_used_pct: Some(8.0),
-            session_reset_time_text: Some("Jul 13, 8:40pm (Asia/Jakarta)".into()),
-            week_used_pct: Some(10.0),
-            week_reset_time_text: Some("Jul 18, 4am (Asia/Jakarta)".into()),
+            claude: ClaudeState {
+                session_used_pct: Some(8.0),
+                session_reset_time_text: Some("Jul 13, 8:40pm (Asia/Jakarta)".into()),
+                week_used_pct: Some(10.0),
+                week_reset_time_text: Some("Jul 18, 4am (Asia/Jakarta)".into()),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
-        let (display, _events) = poll_cycle(Some(WEEK_ONLY_USAGE_TEXT), &now, &config, &prev);
+        let (display, _events) = poll_cycle(
+            Some(WEEK_ONLY_USAGE_TEXT),
+            &now,
+            &config,
+            &prev,
+            true,
+            false,
+            None,
+        );
 
-        assert!(!display.stale, "awaiting session should not be treated as stale");
-        assert_eq!(display.session_used_pct, Some(0.0));
-        assert_eq!(display.session_reset_time_text, Some("Not started".to_string()));
-        assert_eq!(display.session_pacing, None, "no pacing badge while awaiting a session");
-        assert_eq!(display.week_used_pct, Some(13.0), "week should keep updating normally");
+        assert!(
+            !display.claude.stale,
+            "awaiting session should not be treated as stale"
+        );
+        assert_eq!(display.claude.session_used_pct, Some(0.0));
+        assert_eq!(
+            display.claude.session_reset_time_text,
+            Some("Not started".to_string())
+        );
+        assert_eq!(
+            display.claude.session_pacing, None,
+            "no pacing badge while awaiting a session"
+        );
+        assert_eq!(
+            display.claude.week_used_pct,
+            Some(13.0),
+            "week should keep updating normally"
+        );
     }
 
     #[test]
@@ -553,10 +988,14 @@ mod tests {
         let now = make_time(14, 0, 0);
         let config = Config::default();
         let prev = DisplayState {
-            session_used_pct: Some(8.0),
-            session_reset_time_text: Some("Jul 13, 8:40pm (Asia/Jakarta)".into()),
-            week_used_pct: Some(10.0),
-            week_reset_time_text: Some("Jul 18, 4am (Asia/Jakarta)".into()),
+            claude: ClaudeState {
+                session_used_pct: Some(8.0),
+                session_reset_time_text: Some("Jul 13, 8:40pm (Asia/Jakarta)".into()),
+                week_used_pct: Some(10.0),
+                week_reset_time_text: Some("Jul 18, 4am (Asia/Jakarta)".into()),
+                diagnostic: Some("previous diagnostic".into()),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -564,10 +1003,25 @@ mod tests {
         // not the clean "no session line at all" case, so it must stay Stale.
         let text = "Current session: used \u{00b7} resets Jul 13, 8:40pm (Asia/Jakarta)\nCurrent week (all models): 13% used \u{00b7} resets Jul 18, 4am (Asia/Jakarta)";
 
-        let (display, _events) = poll_cycle(Some(text), &now, &config, &prev);
+        let (display, _events) = poll_cycle(Some(text), &now, &config, &prev, true, false, None);
 
-        assert!(display.stale, "malformed session line should remain Stale, not Awaiting session");
-        assert_eq!(display.session_used_pct, Some(8.0), "previous value carried forward while stale");
+        assert!(
+            display.claude.stale,
+            "malformed session line should remain Stale, not Awaiting session"
+        );
+        assert_eq!(
+            display.claude.session_used_pct,
+            Some(8.0),
+            "previous value carried forward while stale"
+        );
+        assert_eq!(
+            display.claude.diagnostic.as_deref(),
+            Some("previous diagnostic")
+        );
+        assert!(
+            matches!(display.deepseek_status, DeepSeekStatus::Peak { .. }),
+            "DeepSeek should remain independently computed"
+        );
     }
 
     #[test]
@@ -576,12 +1030,17 @@ mod tests {
         let config = Config::default();
         let prev = DisplayState::default();
 
-        let (display, _events) = poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev);
+        let (display, _events) =
+            poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev, true, false, None);
 
-        assert!(!display.stale);
-        assert_eq!(display.session_used_pct, Some(8.0));
-        assert_eq!(display.week_used_pct, Some(13.0));
-        assert!(display.session_reset_time_text.unwrap().contains("Jul 13, 8:40pm"));
+        assert!(!display.claude.stale);
+        assert_eq!(display.claude.session_used_pct, Some(8.0));
+        assert_eq!(display.claude.week_used_pct, Some(13.0));
+        assert!(display
+            .claude
+            .session_reset_time_text
+            .unwrap()
+            .contains("Jul 13, 8:40pm"));
     }
 
     #[test]
@@ -590,10 +1049,10 @@ mod tests {
         let config = Config::default();
         let prev = DisplayState::default();
 
-        let (display, _events) = poll_cycle(None, &now, &config, &prev);
+        let (display, _events) = poll_cycle(None, &now, &config, &prev, true, false, None);
 
-        assert!(display.stale);
-        assert_eq!(display.session_used_pct, None);
+        assert!(display.claude.stale);
+        assert_eq!(display.claude.session_used_pct, None);
     }
 
     #[test]
@@ -601,18 +1060,718 @@ mod tests {
         let now = make_time(14, 0, 0);
         let config = Config::default();
         let prev = DisplayState {
-            session_used_pct: Some(8.0),
-            session_reset_time_text: Some("Jul 13, 8:40pm (Asia/Jakarta)".into()),
-            week_used_pct: Some(13.0),
-            week_reset_time_text: Some("Jul 18, 4am (Asia/Jakarta)".into()),
+            claude: ClaudeState {
+                session_used_pct: Some(8.0),
+                session_reset_time_text: Some("Jul 13, 8:40pm (Asia/Jakarta)".into()),
+                week_used_pct: Some(13.0),
+                week_reset_time_text: Some("Jul 18, 4am (Asia/Jakarta)".into()),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
-        let (display, _events) = poll_cycle(Some("garbage malformed text"), &now, &config, &prev);
+        let (display, _events) = poll_cycle(
+            Some("garbage malformed text"),
+            &now,
+            &config,
+            &prev,
+            true,
+            false,
+            None,
+        );
 
-        assert!(display.stale);
-        assert_eq!(display.session_used_pct, Some(8.0));
-        assert_eq!(display.week_used_pct, Some(13.0));
+        assert!(display.claude.stale);
+        assert_eq!(display.claude.session_used_pct, Some(8.0));
+        assert_eq!(display.claude.week_used_pct, Some(13.0));
+    }
+
+    #[test]
+    fn test_claude_disabled_with_no_prev_returns_default() {
+        let now = make_time(14, 0, 0);
+        let config = Config::default();
+        let (display, _events) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &now,
+            &config,
+            &DisplayState::default(),
+            false,
+            false,
+            None,
+        );
+        assert_eq!(
+            display.claude,
+            ClaudeState {
+                enabled: false,
+                ..Default::default()
+            }
+        );
+        assert!(!display.claude.stale);
+        assert!(display.claude.diagnostic.is_none());
+    }
+
+    #[test]
+    fn test_claude_disabled_with_prev_fresh_does_not_persist_old() {
+        let now = make_time(14, 0, 0);
+        let config = Config::default();
+        let prev = DisplayState {
+            claude: ClaudeState {
+                enabled: true,
+                session_used_pct: Some(50.0),
+                session_reset_time_text: Some("old session".into()),
+                week_used_pct: Some(30.0),
+                week_reset_time_text: Some("old week".into()),
+                stale: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (display, _events) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &now,
+            &config,
+            &prev,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(
+            display.claude,
+            ClaudeState {
+                enabled: false,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn test_claude_re_enabled_after_disabled_cycle_reads_fresh() {
+        let now = make_time(14, 0, 0);
+        let config = Config::default();
+        let prev = DisplayState {
+            claude: ClaudeState {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (display, _events) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &now,
+            &config,
+            &prev,
+            true,
+            false,
+            None,
+        );
+        assert_eq!(display.claude.session_used_pct, Some(8.0));
+        assert_eq!(display.claude.week_used_pct, Some(13.0));
+        assert!(display.claude.enabled);
+    }
+
+    #[test]
+    fn test_codex_disabled_ignores_result_and_is_not_displayed() {
+        let now = make_time(14, 0, 0);
+        let config = Config::default();
+        let result = CodexPollResult::Success {
+            windows: vec![CodexPollWindow {
+                kind: CodexWindowKind::Primary,
+                used_pct: 25.0,
+                reset_at: None,
+                reset_time_text: None,
+                window_duration_mins: Some(300),
+            }],
+        };
+
+        let (display, events) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &now,
+            &config,
+            &DisplayState::default(),
+            true,
+            false,
+            Some(&result),
+        );
+
+        assert_eq!(display.codex, CodexState::default());
+        assert!(
+            events.is_empty()
+                || events
+                    .iter()
+                    .all(|event| matches!(event, NotificationEvent::DeepSeekPeakStarted { .. }))
+        );
+    }
+
+    #[test]
+    fn test_codex_primary_window_is_available_and_paced_without_notifications() {
+        let now = make_time(14, 0, 0);
+        let config = Config::default();
+        let reset_at = chrono::DateTime::parse_from_rfc3339("2026-07-13T15:00:00+07:00").unwrap();
+        let result = CodexPollResult::Success {
+            windows: vec![CodexPollWindow {
+                kind: CodexWindowKind::Primary,
+                used_pct: 50.0,
+                reset_at: Some(reset_at),
+                reset_time_text: Some(reset_at.to_rfc3339()),
+                window_duration_mins: Some(300),
+            }],
+        };
+
+        let (display, events) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &now,
+            &config,
+            &DisplayState::default(),
+            true,
+            true,
+            Some(&result),
+        );
+
+        let primary = display
+            .codex
+            .primary
+            .as_ref()
+            .expect("primary window should be displayed");
+        assert!(display.codex.available);
+        assert!(!display.codex.stale);
+        assert_eq!(primary.label, "5-hour");
+        assert_eq!(primary.used_pct, 50.0);
+        assert_eq!(primary.pacing, Some(Pacing::Underusing));
+        assert!(events
+            .iter()
+            .all(|event| matches!(event, NotificationEvent::DeepSeekPeakStarted { .. })));
+    }
+
+    #[test]
+    fn test_codex_primary_and_secondary_windows_are_both_displayed() {
+        let now = make_time(14, 0, 0);
+        let reset = chrono::DateTime::parse_from_rfc3339("2026-07-13T15:00:00+07:00").unwrap();
+        let result = CodexPollResult::Success {
+            windows: vec![
+                CodexPollWindow {
+                    kind: CodexWindowKind::Primary,
+                    used_pct: 50.0,
+                    reset_at: Some(reset),
+                    reset_time_text: Some("primary reset".into()),
+                    window_duration_mins: Some(300),
+                },
+                CodexPollWindow {
+                    kind: CodexWindowKind::Secondary,
+                    used_pct: 25.0,
+                    reset_at: Some(reset),
+                    reset_time_text: Some("secondary reset".into()),
+                    window_duration_mins: Some(7 * 24 * 60),
+                },
+            ],
+        };
+        let (display, events) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &now,
+            &Config::default(),
+            &DisplayState::default(),
+            true,
+            true,
+            Some(&result),
+        );
+        assert_eq!(display.codex.windows.len(), 2);
+        assert_eq!(display.codex.windows[0].label, "5-hour");
+        assert_eq!(display.codex.windows[1].label, "7-day");
+        assert!(events.iter().all(|event| matches!(
+            event,
+            NotificationEvent::DeepSeekPeakStarted { .. } | NotificationEvent::DeepSeekPeakEnded
+        )));
+    }
+
+    #[test]
+    fn test_codex_missing_optional_secondary_is_success() {
+        let result = CodexPollResult::Success {
+            windows: vec![CodexPollWindow {
+                kind: CodexWindowKind::Primary,
+                used_pct: 10.0,
+                reset_at: None,
+                reset_time_text: None,
+                window_duration_mins: None,
+            }],
+        };
+        let (display, _) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &make_time(14, 0, 0),
+            &Config::default(),
+            &DisplayState::default(),
+            true,
+            true,
+            Some(&result),
+        );
+        assert!(display.codex.available);
+        assert_eq!(display.codex.windows.len(), 1);
+        assert_eq!(display.codex.windows[0].pacing, None);
+        assert_eq!(display.codex.windows[0].used_pct, 10.0);
+    }
+
+    #[test]
+    fn test_codex_fresh_incomplete_metadata_does_not_reuse_old_pace() {
+        let previous = CodexState {
+            enabled: true,
+            available: true,
+            primary: Some(CodexWindowState {
+                label: "5-hour".into(),
+                used_pct: 10.0,
+                reset_time_text: None,
+                pacing: Some(Pacing::Underusing),
+            }),
+            windows: vec![],
+            ..Default::default()
+        };
+        let previous = DisplayState {
+            codex: previous,
+            ..Default::default()
+        };
+        let result = CodexPollResult::Success {
+            windows: vec![CodexPollWindow {
+                kind: CodexWindowKind::Primary,
+                used_pct: 90.0,
+                reset_at: None,
+                reset_time_text: None,
+                window_duration_mins: None,
+            }],
+        };
+        let (display, _) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &make_time(14, 0, 0),
+            &Config::default(),
+            &previous,
+            true,
+            true,
+            Some(&result),
+        );
+        assert_eq!(display.codex.windows[0].pacing, None);
+    }
+
+    #[test]
+    fn test_codex_pacing_clamps_after_reset_and_exhaustion_before_reset() {
+        let reset = chrono::DateTime::parse_from_rfc3339("2026-07-13T15:00:00+07:00").unwrap();
+        let exhausted = CodexPollResult::Success {
+            windows: vec![CodexPollWindow {
+                kind: CodexWindowKind::Primary,
+                used_pct: 100.0,
+                reset_at: Some(reset),
+                reset_time_text: None,
+                window_duration_mins: Some(300),
+            }],
+        };
+        let (before, _) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &make_time(12, 0, 0),
+            &Config::default(),
+            &DisplayState::default(),
+            true,
+            true,
+            Some(&exhausted),
+        );
+        assert_eq!(before.codex.windows[0].pacing, Some(Pacing::Overusing));
+        let (after, _) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &make_time(16, 0, 0),
+            &Config::default(),
+            &DisplayState::default(),
+            true,
+            true,
+            Some(&exhausted),
+        );
+        assert_eq!(after.codex.windows[0].pacing, Some(Pacing::OnPace));
+    }
+
+    #[test]
+    fn test_claude_disabled_produces_no_claude_events_across_cycles() {
+        let config = Config::default();
+        let prev = DisplayState::default();
+        // Two cycles that would cross a DeepSeek window boundary, verifying
+        // only DeepSeek events fire — Claude produces no events of its own.
+        let (d1, e1) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &make_time(8, 0, 0),
+            &config,
+            &prev,
+            false,
+            false,
+            None,
+        );
+        let (_d2, e2) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &make_time(10, 0, 0),
+            &config,
+            &d1,
+            false,
+            false,
+            None,
+        );
+        let all_deepseek = e1
+            .iter()
+            .chain(e2.iter())
+            .all(|e| matches!(e, NotificationEvent::DeepSeekPeakStarted { .. }));
+        assert!(
+            all_deepseek,
+            "only DeepSeek events should fire when Claude is disabled"
+        );
+        assert_eq!(e1.len(), 1);
+        assert_eq!(e2.len(), 0);
+    }
+
+    #[test]
+    fn test_claude_disabled_codex_failure_still_shows_codex_diagnostic() {
+        let now = make_time(14, 0, 0);
+        let config = Config::default();
+        let result = CodexPollResult::Failure {
+            diagnostic: "Codex rate-limit request timed out.".into(),
+        };
+        let (display, _events) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &now,
+            &config,
+            &DisplayState::default(),
+            false,
+            true,
+            Some(&result),
+        );
+        assert_eq!(
+            display.claude,
+            ClaudeState {
+                enabled: false,
+                ..Default::default()
+            },
+            "Claude should be default/empty when disabled"
+        );
+        assert_eq!(
+            display.codex.diagnostic.as_deref(),
+            Some("Codex rate-limit request timed out."),
+            "Codex diagnostic must remain visible even with Claude disabled"
+        );
+        assert!(display.codex.enabled);
+        assert!(!display.codex.available);
+    }
+
+    #[test]
+    fn test_codex_first_poll_failure_is_visible_unavailable() {
+        let now = make_time(14, 0, 0);
+        let config = Config::default();
+        let result = CodexPollResult::Failure {
+            diagnostic: "Codex login required: run `codex login`.".into(),
+        };
+
+        let (display, _events) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &now,
+            &config,
+            &DisplayState::default(),
+            true,
+            true,
+            Some(&result),
+        );
+
+        assert!(display.codex.enabled);
+        assert!(!display.codex.loading);
+        assert!(!display.codex.available);
+        assert!(!display.codex.stale);
+        assert!(display.codex.primary.is_none());
+        assert_eq!(
+            display.codex.diagnostic.as_deref(),
+            Some("Codex login required: run `codex login`.")
+        );
+        assert!(!display.claude.stale);
+    }
+
+    #[test]
+    fn test_codex_failure_retains_only_codex_values_and_claude_stays_live() {
+        let retained = CodexWindowState {
+            label: "5-hour".into(),
+            used_pct: 31.0,
+            reset_time_text: Some("old reset".into()),
+            pacing: Some(Pacing::OnPace),
+        };
+        let previous = DisplayState {
+            codex: CodexState {
+                enabled: true,
+                available: true,
+                primary: Some(retained.clone()),
+                windows: vec![retained],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = CodexPollResult::Failure {
+            diagnostic: "Codex rate-limit request timed out.".into(),
+        };
+        let (display, _) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &make_time(14, 0, 0),
+            &Config::default(),
+            &previous,
+            true,
+            true,
+            Some(&result),
+        );
+        assert!(display.codex.stale);
+        assert_eq!(display.codex.windows[0].used_pct, 31.0);
+        assert_eq!(
+            display.codex.diagnostic.as_deref(),
+            Some("Codex rate-limit request timed out.")
+        );
+        assert!(!display.claude.stale);
+        assert!(display.claude.diagnostic.is_none());
+    }
+
+    #[test]
+    fn test_codex_success_recovers_and_replaces_retained_values() {
+        let previous = DisplayState {
+            codex: CodexState {
+                enabled: true,
+                available: true,
+                stale: true,
+                primary: Some(CodexWindowState {
+                    label: "5-hour".into(),
+                    used_pct: 31.0,
+                    reset_time_text: Some("old reset".into()),
+                    pacing: None,
+                }),
+                windows: vec![],
+                diagnostic: Some("temporary failure".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = CodexPollResult::Success {
+            windows: vec![CodexPollWindow {
+                kind: CodexWindowKind::Primary,
+                used_pct: 44.0,
+                reset_at: None,
+                reset_time_text: Some("new reset".into()),
+                window_duration_mins: None,
+            }],
+        };
+        let (display, _) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &make_time(14, 0, 0),
+            &Config::default(),
+            &previous,
+            true,
+            true,
+            Some(&result),
+        );
+        assert!(!display.codex.stale);
+        assert_eq!(display.codex.windows[0].used_pct, 44.0);
+        assert_eq!(
+            display.codex.windows[0].reset_time_text.as_deref(),
+            Some("new reset")
+        );
+        assert!(display.codex.diagnostic.is_none());
+    }
+
+    #[test]
+    fn test_late_codex_result_is_ignored_after_disablement() {
+        let previous = DisplayState {
+            codex: CodexState {
+                enabled: true,
+                available: true,
+                primary: Some(CodexWindowState {
+                    label: "5-hour".into(),
+                    used_pct: 31.0,
+                    reset_time_text: None,
+                    pacing: None,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = CodexPollResult::Success {
+            windows: vec![CodexPollWindow {
+                kind: CodexWindowKind::Primary,
+                used_pct: 99.0,
+                reset_at: None,
+                reset_time_text: None,
+                window_duration_mins: None,
+            }],
+        };
+        let (display, _) = poll_cycle(
+            Some(VALID_USAGE_TEXT),
+            &make_time(14, 0, 0),
+            &Config::default(),
+            &previous,
+            true,
+            false,
+            Some(&result),
+        );
+        assert_eq!(display.codex, CodexState::default());
+        assert!(!display.claude.stale);
+    }
+
+    #[test]
+    fn test_classified_codex_failures_remain_concise_and_actionable() {
+        assert_eq!(
+            codex_failure_diagnostic("authentication required"),
+            "Codex login required: run `codex login`."
+        );
+        assert_eq!(
+            codex_failure_diagnostic("method not found"),
+            "Codex CLI update required for rate-limit monitoring."
+        );
+        assert_eq!(
+            codex_failure_diagnostic("unexpected server error"),
+            "Codex rate-limit poll failed."
+        );
+        for diagnostic in [
+            "Codex CLI not found on PATH.",
+            "Codex login required: run `codex login`.",
+            "Codex CLI update required for rate-limit monitoring.",
+            "Codex rate-limit request timed out.",
+            "Codex rate-limit poll failed.",
+        ] {
+            let result = CodexPollResult::Failure {
+                diagnostic: diagnostic.into(),
+            };
+            let (display, _) = poll_cycle(
+                Some(VALID_USAGE_TEXT),
+                &make_time(14, 0, 0),
+                &Config::default(),
+                &DisplayState::default(),
+                true,
+                true,
+                Some(&result),
+            );
+            assert_eq!(display.codex.diagnostic.as_deref(), Some(diagnostic));
+            assert!(diagnostic.len() < 100);
+        }
+    }
+
+    #[test]
+    fn test_codex_initialize_accepts_current_and_legacy_result_shapes() {
+        assert!(has_codex_initialize_result(&serde_json::json!({
+            "result": {
+                "serverInfo": { "name": "codex" },
+                "capabilities": { "experimentalApi": true }
+            }
+        })));
+        assert!(has_codex_initialize_result(&serde_json::json!({
+            "result": { "serverInfo": { "name": "codex", "version": "1.2.3" } }
+        })));
+        assert!(!has_codex_initialize_result(&serde_json::json!({
+            "result": "1.2.3"
+        })));
+    }
+
+    #[test]
+    fn test_logical_size_to_physical_preserves_scaled_widget_dimensions() {
+        assert_eq!(logical_size_to_physical(240, 420, 1.0), (240, 420));
+        assert_eq!(logical_size_to_physical(240, 420, 1.25), (300, 525));
+        assert_eq!(logical_size_to_physical(240, 420, 1.5), (360, 630));
+        assert_eq!(logical_size_to_physical(240, 420, 2.0), (480, 840));
+    }
+
+    #[test]
+    fn test_initialize_without_capabilities_proceeds_to_rate_limit_parsing() {
+        let initialize = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "serverInfo": { "name": "codex" } }
+        });
+        assert!(has_codex_initialize_result(&initialize));
+
+        let rate_limits = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "primary": {
+                            "usedPercent": 42.0,
+                            "resetsAt": 1783951200,
+                            "windowDurationMins": 300
+                        }
+                    }
+                }
+            }
+        });
+        let CodexPollResult::Success { windows } = parse_codex_response(&rate_limits).unwrap()
+        else {
+            panic!("rate-limit response should parse after initialize");
+        };
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].used_pct, 42.0);
+    }
+
+    #[test]
+    fn test_scaled_expansion_clamps_physical_rectangle_at_monitor_edge() {
+        let (width, height) = logical_size_to_physical(240, 420, 1.5);
+        assert_eq!(
+            clamp_window_position(
+                2800,
+                1400,
+                width,
+                height,
+                &Rect {
+                    x: 0,
+                    y: 0,
+                    width: 2880,
+                    height: 1620,
+                }
+            ),
+            (2520, 990)
+        );
+    }
+
+    #[test]
+    fn test_codex_failure_does_not_change_claude_backoff_schedule() {
+        assert_eq!(next_poll_delay_secs(300, 0), 300);
+        assert_eq!(next_poll_delay_secs(300, 1), 600);
+        assert_eq!(next_poll_delay_secs(300, 2), 1200);
+    }
+
+    #[test]
+    fn test_codex_duration_labels_are_literal() {
+        assert_eq!(codex_duration_label(90), "90-minute");
+        assert_eq!(codex_duration_label(5 * 60), "5-hour");
+        assert_eq!(codex_duration_label(7 * 24 * 60), "7-day");
+    }
+
+    #[test]
+    fn test_codex_response_named_bucket_precedes_legacy_and_ignores_other_groups() {
+        let response = serde_json::json!({ "result": {
+            "rateLimitsByLimitId": { "other": { "primary": { "usedPercent": 1.0 } }, "codex": { "primary": { "usedPercent": 42.0, "windowDurationMins": 90 } } },
+            "rateLimits": { "primary": { "usedPercent": 2.0, "windowDurationMins": 5 } }
+        } });
+        let CodexPollResult::Success { windows } = parse_codex_response(&response).unwrap() else {
+            panic!("expected success")
+        };
+        assert_eq!(
+            (windows[0].used_pct, windows[0].window_duration_mins),
+            (42.0, Some(90))
+        );
+    }
+
+    #[test]
+    fn test_codex_response_legacy_fallback_and_optional_secondary() {
+        let response = serde_json::json!({ "result": { "rateLimitsByLimitId": { "other": {} }, "rateLimits": {
+            "primary": { "usedPercent": 12.0, "resetsAt": "2026-07-18T10:00:00Z" }
+        } } });
+        let CodexPollResult::Success { windows } = parse_codex_response(&response).unwrap() else {
+            panic!("expected success")
+        };
+        assert_eq!(windows.len(), 1);
+        assert_eq!(
+            windows[0].reset_time_text.as_deref(),
+            Some("2026-07-18T10:00:00Z")
+        );
+        assert_eq!(windows[0].kind, CodexWindowKind::Primary);
+    }
+
+    #[test]
+    fn test_codex_response_ignores_credits_spend_histories_and_reset_credits() {
+        let response = serde_json::json!({ "result": { "rateLimitsByLimitId": { "codex": {
+            "primary": { "usedPercent": 12.0 }, "credits": { "usedPercent": 99.0 }, "spend": { "usedPercent": 88.0 },
+            "tokenHistory": { "usedPercent": 77.0 }, "resetCredits": { "usedPercent": 66.0 }
+        } } } });
+        let CodexPollResult::Success { windows } = parse_codex_response(&response).unwrap() else {
+            panic!("expected success")
+        };
+        assert_eq!(windows.len(), 1);
     }
 
     #[test]
@@ -634,37 +1793,61 @@ mod tests {
 
     #[test]
     fn test_pacing_underusing() {
-        assert_eq!(compute_pacing(10.0, 50.0), Pacing::Underusing);
+        assert_eq!(compute_pacing(10.0, 50.0, 1.0, 1.0), Pacing::Underusing);
     }
 
     #[test]
     fn test_pacing_on_pace() {
-        assert_eq!(compute_pacing(50.0, 50.0), Pacing::OnPace);
-        assert_eq!(compute_pacing(50.5, 50.0), Pacing::OnPace);
-        assert_eq!(compute_pacing(49.5, 50.0), Pacing::OnPace);
+        assert_eq!(compute_pacing(50.0, 50.0, 1.0, 1.0), Pacing::OnPace);
+        assert_eq!(compute_pacing(50.5, 50.0, 1.0, 1.0), Pacing::OnPace);
+        assert_eq!(compute_pacing(49.5, 50.0, 1.0, 1.0), Pacing::OnPace);
     }
 
     #[test]
     fn test_pacing_overusing() {
-        assert_eq!(compute_pacing(70.0, 50.0), Pacing::Overusing);
+        assert_eq!(compute_pacing(70.0, 50.0, 1.0, 1.0), Pacing::Overusing);
     }
 
     #[test]
     fn test_pacing_boundaries() {
-        assert_eq!(compute_pacing(49.0, 50.0), Pacing::OnPace);
-        assert_eq!(compute_pacing(51.0, 50.0), Pacing::OnPace);
-        assert_eq!(compute_pacing(48.0, 50.0), Pacing::Underusing);
-        assert_eq!(compute_pacing(52.0, 50.0), Pacing::Overusing);
+        assert_eq!(compute_pacing(49.0, 50.0, 1.0, 1.0), Pacing::OnPace);
+        assert_eq!(compute_pacing(51.0, 50.0, 1.0, 1.0), Pacing::OnPace);
+        assert_eq!(compute_pacing(48.0, 50.0, 1.0, 1.0), Pacing::Underusing);
+        assert_eq!(compute_pacing(52.0, 50.0, 1.0, 1.0), Pacing::Overusing);
     }
 
     #[test]
     fn test_pacing_100_percent_before_reset_overusing() {
-        assert_eq!(compute_pacing(100.0, 50.0), Pacing::Overusing);
+        assert_eq!(compute_pacing(100.0, 50.0, 1.0, 1.0), Pacing::Overusing);
     }
 
     #[test]
     fn test_pacing_100_percent_at_reset_time_on_pace() {
-        assert_eq!(compute_pacing(100.0, 100.0), Pacing::OnPace);
+        assert_eq!(compute_pacing(100.0, 100.0, 1.0, 1.0), Pacing::OnPace);
+    }
+
+    #[test]
+    fn test_pacing_non_default_thresholds() {
+        assert_eq!(
+            compute_pacing(45.0, 50.0, 5.0, 10.0),
+            Pacing::OnPace,
+            "diff -5, under=5 → OnPace (diff >= -5)"
+        );
+        assert_eq!(
+            compute_pacing(44.0, 50.0, 5.0, 10.0),
+            Pacing::Underusing,
+            "diff -6, under=5 → Underusing"
+        );
+        assert_eq!(
+            compute_pacing(60.0, 50.0, 5.0, 10.0),
+            Pacing::OnPace,
+            "diff +10, over=10 → OnPace (diff <= 10)"
+        );
+        assert_eq!(
+            compute_pacing(61.0, 50.0, 5.0, 10.0),
+            Pacing::Overusing,
+            "diff +11, over=10 → Overusing"
+        );
     }
 
     #[test]
@@ -681,7 +1864,12 @@ mod tests {
         let now = beijing_time(10, 0, 0);
         let config = Config::default();
         let (status, info) = compute_deepseek_status(&now, &config);
-        assert_eq!(status, DeepSeekStatus::Peak { window_label: "09:00–12:00 BJT".into() });
+        assert_eq!(
+            status,
+            DeepSeekStatus::Peak {
+                window_label: "09:00–12:00 BJT".into()
+            }
+        );
         assert!(info.unwrap().contains("Peak ends"));
     }
 
@@ -690,7 +1878,12 @@ mod tests {
         let now = beijing_time(16, 30, 0);
         let config = Config::default();
         let (status, info) = compute_deepseek_status(&now, &config);
-        assert_eq!(status, DeepSeekStatus::Peak { window_label: "14:00–18:00 BJT".into() });
+        assert_eq!(
+            status,
+            DeepSeekStatus::Peak {
+                window_label: "14:00–18:00 BJT".into()
+            }
+        );
         assert!(info.unwrap().contains("Peak ends"));
     }
 
@@ -708,7 +1901,12 @@ mod tests {
         let config = Config::default();
         let now = beijing_time(9, 0, 0);
         let (status, _) = compute_deepseek_status(&now, &config);
-        assert_eq!(status, DeepSeekStatus::Peak { window_label: "09:00–12:00 BJT".into() });
+        assert_eq!(
+            status,
+            DeepSeekStatus::Peak {
+                window_label: "09:00–12:00 BJT".into()
+            }
+        );
     }
 
     #[test]
@@ -728,7 +1926,8 @@ mod tests {
         };
         let now = beijing_time(10, 0, 0);
 
-        let (_display, events) = poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev);
+        let (_display, events) =
+            poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev, true, false, None);
 
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -743,12 +1942,15 @@ mod tests {
     fn test_deepseek_notification_on_transition_to_offpeak() {
         let config = Config::default();
         let prev = DisplayState {
-            deepseek_status: DeepSeekStatus::Peak { window_label: "09:00–12:00 BJT".into() },
+            deepseek_status: DeepSeekStatus::Peak {
+                window_label: "09:00–12:00 BJT".into(),
+            },
             ..Default::default()
         };
         let now = beijing_time(13, 0, 0);
 
-        let (_display, events) = poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev);
+        let (_display, events) =
+            poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev, true, false, None);
 
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -766,19 +1968,26 @@ mod tests {
         };
         let now = beijing_time(13, 0, 0);
 
-        let (_display, events) = poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev);
+        let (_display, events) =
+            poll_cycle(Some(VALID_USAGE_TEXT), &now, &config, &prev, true, false, None);
 
         assert_eq!(events.len(), 0);
     }
 
     #[test]
     fn test_different_local_timezone_detects_peak_correctly() {
-        let now = FixedOffset::west_opt(5 * 3600).unwrap()
+        let now = FixedOffset::west_opt(5 * 3600)
+            .unwrap()
             .with_ymd_and_hms(2026, 7, 13, 21, 0, 0)
             .unwrap();
         let config = Config::default();
         let (status, _) = compute_deepseek_status(&now, &config);
-        assert_eq!(status, DeepSeekStatus::Peak { window_label: "09:00–12:00 BJT".into() });
+        assert_eq!(
+            status,
+            DeepSeekStatus::Peak {
+                window_label: "09:00–12:00 BJT".into()
+            }
+        );
     }
 
     #[test]
@@ -829,5 +2038,219 @@ mod tests {
         assert_eq!(dt.day(), 18);
         assert_eq!(dt.hour(), 4);
         assert_eq!(dt.minute(), 0);
+    }
+
+    #[test]
+    fn test_rects_overlap_full_containment() {
+        let a = Rect {
+            x: 100,
+            y: 100,
+            width: 240,
+            height: 185,
+        };
+        let b = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        assert!(rects_overlap(&a, &b));
+        assert!(rects_overlap(&b, &a));
+    }
+
+    #[test]
+    fn test_rects_no_overlap_separate() {
+        let a = Rect {
+            x: -2000,
+            y: -2000,
+            width: 240,
+            height: 185,
+        };
+        let b = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        assert!(!rects_overlap(&a, &b));
+    }
+
+    #[test]
+    fn test_rects_overlap_partial_edge() {
+        let a = Rect {
+            x: 1800,
+            y: 100,
+            width: 240,
+            height: 185,
+        };
+        let b = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        assert!(rects_overlap(&a, &b));
+    }
+
+    #[test]
+    fn test_rects_touching_edge_no_overlap() {
+        let a = Rect {
+            x: 1920,
+            y: 0,
+            width: 240,
+            height: 185,
+        };
+        let b = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        assert!(!rects_overlap(&a, &b));
+    }
+
+    #[test]
+    fn test_is_position_visible_fully_on_one_monitor() {
+        let window = Rect {
+            x: 100,
+            y: 100,
+            width: 240,
+            height: 185,
+        };
+        let monitors = vec![Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }];
+        assert!(is_position_visible(&window, &monitors));
+    }
+
+    #[test]
+    fn test_is_position_visible_fully_off_all_monitors() {
+        let window = Rect {
+            x: -2000,
+            y: -2000,
+            width: 240,
+            height: 185,
+        };
+        let monitors = vec![Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }];
+        assert!(!is_position_visible(&window, &monitors));
+    }
+
+    #[test]
+    fn test_is_position_visible_partially_overlapping_edge() {
+        let window = Rect {
+            x: 1800,
+            y: 100,
+            width: 240,
+            height: 185,
+        };
+        let monitors = vec![Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }];
+        assert!(is_position_visible(&window, &monitors));
+    }
+
+    #[test]
+    fn test_is_position_visible_spanning_two_adjacent_monitors() {
+        let window = Rect {
+            x: 1900,
+            y: 100,
+            width: 240,
+            height: 185,
+        };
+        let monitors = vec![
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            Rect {
+                x: 1920,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        ];
+        assert!(is_position_visible(&window, &monitors));
+    }
+
+    #[test]
+    fn test_is_position_visible_empty_monitor_list() {
+        let window = Rect {
+            x: 100,
+            y: 100,
+            width: 240,
+            height: 185,
+        };
+        let monitors: Vec<Rect> = vec![];
+        assert!(!is_position_visible(&window, &monitors));
+    }
+
+    #[test]
+    fn test_clamp_window_position_preserves_position_when_it_fits() {
+        assert_eq!(
+            clamp_window_position(
+                100,
+                200,
+                240,
+                185,
+                &Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080
+                }
+            ),
+            (100, 200)
+        );
+    }
+
+    #[test]
+    fn test_clamp_window_position_keeps_expanded_widget_on_screen() {
+        assert_eq!(
+            clamp_window_position(
+                1800,
+                900,
+                240,
+                420,
+                &Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080
+                }
+            ),
+            (1680, 660)
+        );
+    }
+
+    #[test]
+    fn test_clamp_window_position_handles_window_taller_than_monitor() {
+        assert_eq!(
+            clamp_window_position(
+                10,
+                20,
+                240,
+                1200,
+                &Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080
+                }
+            ),
+            (10, 0)
+        );
     }
 }

@@ -1,19 +1,21 @@
 pub mod poll_cycle;
 
-use std::sync::Mutex;
+use std::io::{BufRead, Read, Write};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{
     image::Image,
     menu::Menu,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder,
+    Emitter, LogicalSize, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder,
 };
-use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_notification::NotificationExt;
 
 pub struct AppState {
     pub poll_cycle_state: poll_cycle::DisplayState,
     pub consecutive_failures: u32,
+    pub settings_generation: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -28,6 +30,10 @@ struct SavedSettings {
     over_pace_threshold: u32,
     #[serde(default = "default_widget_opacity")]
     widget_opacity: f64,
+    #[serde(default)]
+    enable_codex: bool,
+    #[serde(default = "default_enable_claude")]
+    enable_claude: bool,
 }
 
 fn default_under_pace_threshold() -> u32 {
@@ -46,6 +52,10 @@ fn default_widget_opacity() -> f64 {
     0.92
 }
 
+fn default_enable_claude() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct WindowConfig {
     start_hour: u8,
@@ -56,14 +66,22 @@ impl Default for SavedSettings {
     fn default() -> Self {
         Self {
             deepseek_windows: vec![
-                WindowConfig { start_hour: 9, end_hour: 12 },
-                WindowConfig { start_hour: 14, end_hour: 18 },
+                WindowConfig {
+                    start_hour: 9,
+                    end_hour: 12,
+                },
+                WindowConfig {
+                    start_hour: 14,
+                    end_hour: 18,
+                },
             ],
             auto_launch: true,
             poll_interval_minutes: default_poll_interval_minutes(),
             under_pace_threshold: default_under_pace_threshold(),
             over_pace_threshold: default_over_pace_threshold(),
             widget_opacity: default_widget_opacity(),
+            enable_codex: false,
+            enable_claude: default_enable_claude(),
         }
     }
 }
@@ -95,30 +113,37 @@ fn save_settings_to_disk(app: &tauri::AppHandle, settings: &SavedSettings) {
 
 fn settings_to_config(settings: &SavedSettings) -> poll_cycle::Config {
     poll_cycle::Config {
-        deepseek_windows: settings.deepseek_windows.iter().map(|w| {
-            poll_cycle::DeepSeekWindow {
+        deepseek_windows: settings
+            .deepseek_windows
+            .iter()
+            .map(|w| poll_cycle::DeepSeekWindow {
                 start_hour: w.start_hour,
                 end_hour: w.end_hour,
-            }
-        }).collect(),
+            })
+            .collect(),
         under_pace_threshold: settings.under_pace_threshold as f64,
         over_pace_threshold: settings.over_pace_threshold as f64,
     }
 }
 
 fn to_json(state: &poll_cycle::DisplayState, app: &tauri::AppHandle) -> serde_json::Value {
-    let opacity = load_settings(app).widget_opacity;
+    state_to_json(state, load_settings(app).widget_opacity)
+}
+
+fn state_to_json(state: &poll_cycle::DisplayState, opacity: f64) -> serde_json::Value {
+    let claude = &state.claude;
+    let codex = &state.codex;
     serde_json::json!({
-        "session_pct": state.session_used_pct.map(|v| format!("{:.0}%", v)),
-        "session_reset": state.session_reset_time_text,
-        "session_pacing": state.session_pacing.as_ref().map(|p| match p {
+        "session_pct": claude.session_used_pct.map(|v| format!("{:.0}%", v)),
+        "session_reset": claude.session_reset_time_text,
+        "session_pacing": claude.session_pacing.as_ref().map(|p| match p {
             poll_cycle::Pacing::Underusing => "under",
             poll_cycle::Pacing::OnPace => "onpace",
             poll_cycle::Pacing::Overusing => "over",
         }),
-        "week_pct": state.week_used_pct.map(|v| format!("{:.0}%", v)),
-        "week_reset": state.week_reset_time_text,
-        "week_pacing": state.week_pacing.as_ref().map(|p| match p {
+        "week_pct": claude.week_used_pct.map(|v| format!("{:.0}%", v)),
+        "week_reset": claude.week_reset_time_text,
+        "week_pacing": claude.week_pacing.as_ref().map(|p| match p {
             poll_cycle::Pacing::Underusing => "under",
             poll_cycle::Pacing::OnPace => "onpace",
             poll_cycle::Pacing::Overusing => "over",
@@ -129,9 +154,30 @@ fn to_json(state: &poll_cycle::DisplayState, app: &tauri::AppHandle) -> serde_js
             _ => None,
         },
         "next_transition": state.next_transition_info,
-        "stale": state.stale,
-        "diagnostic": state.diagnostic,
+        "stale": claude.stale,
+        "diagnostic": claude.diagnostic,
+        "claude_enabled": claude.enabled,
+        "codex_enabled": codex.enabled,
+        "codex_loading": codex.loading,
+        "codex_available": codex.available,
+        "codex_stale": codex.stale,
+        "codex_diagnostic": codex.diagnostic,
+        "codex_primary": codex.primary.as_ref().map(codex_window_json),
+        "codex_windows": codex.windows.iter().map(codex_window_json).collect::<Vec<_>>(),
         "widget_opacity": opacity,
+    })
+}
+
+fn codex_window_json(window: &poll_cycle::CodexWindowState) -> serde_json::Value {
+    serde_json::json!({
+        "label": window.label,
+        "used_pct": format!("{:.0}%", window.used_pct),
+        "reset": window.reset_time_text,
+        "pacing": window.pacing.as_ref().map(|p| match p {
+                poll_cycle::Pacing::Underusing => "under",
+                poll_cycle::Pacing::OnPace => "onpace",
+                poll_cycle::Pacing::Overusing => "over",
+            }),
     })
 }
 
@@ -146,21 +192,82 @@ fn get_initial_state(app: tauri::AppHandle) -> serde_json::Value {
     to_json(&state.poll_cycle_state, &app)
 }
 
-fn fire_notifications(
-    app: &tauri::AppHandle,
-    events: &[poll_cycle::NotificationEvent],
-) {
+#[tauri::command]
+fn resize_widget(app: tauri::AppHandle, width: u32, height: u32) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main widget window is unavailable".to_string())?;
+    let position = window.outer_position().map_err(|error| error.to_string())?;
+    let size = window.outer_size().map_err(|error| error.to_string())?;
+    let current = poll_cycle::Rect {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+    };
+    let monitors = app
+        .available_monitors()
+        .map_err(|error| error.to_string())?;
+    let monitor = monitors
+        .iter()
+        .find(|monitor| {
+            let position = monitor.position();
+            let size = monitor.size();
+            poll_cycle::is_position_visible(
+                &current,
+                &[poll_cycle::Rect {
+                    x: position.x,
+                    y: position.y,
+                    width: size.width,
+                    height: size.height,
+                }],
+            )
+        })
+        .or_else(|| monitors.first())
+        .ok_or_else(|| "no display monitor is available".to_string())?;
+    let monitor_position = monitor.position();
+    let monitor_size = monitor.size();
+    let (target_width, target_height) =
+        poll_cycle::logical_size_to_physical(width, height, monitor.scale_factor());
+    let monitor_rect = poll_cycle::Rect {
+        x: monitor_position.x,
+        y: monitor_position.y,
+        width: monitor_size.width,
+        height: monitor_size.height,
+    };
+    let (x, y) = poll_cycle::clamp_window_position(
+        position.x,
+        position.y,
+        target_width,
+        target_height,
+        &monitor_rect,
+    );
+
+    window
+        .set_size(LogicalSize::new(width, height))
+        .map_err(|error| error.to_string())?;
+    window
+        .set_position(PhysicalPosition::new(x, y))
+        .map_err(|error| error.to_string())
+}
+
+fn fire_notifications(app: &tauri::AppHandle, events: &[poll_cycle::NotificationEvent]) {
     for event in events {
         match event {
             poll_cycle::NotificationEvent::DeepSeekPeakStarted { window_label } => {
-                let _ = app.notification()
+                let _ = app
+                    .notification()
                     .builder()
                     .title("DeepSeek Peak Pricing Started")
-                    .body(format!("2× pricing window {} is now active. Requests will cost double.", window_label))
+                    .body(format!(
+                        "2× pricing window {} is now active. Requests will cost double.",
+                        window_label
+                    ))
                     .show();
             }
             poll_cycle::NotificationEvent::DeepSeekPeakEnded => {
-                let _ = app.notification()
+                let _ = app
+                    .notification()
                     .builder()
                     .title("DeepSeek Peak Pricing Ended")
                     .body("Standard pricing has resumed. Requests are back to normal rates.")
@@ -206,20 +313,254 @@ fn run_claude_command() -> Result<String, String> {
             .args(["--print", "/usage"])
             .output()
         {
-            Ok(out) if out.status.success() => {
-                String::from_utf8(out.stdout)
-                    .map(|s| s.trim().to_string())
-                    .map_err(|e| format!("claude output is not UTF-8: {e}"))
-            }
+            Ok(out) if out.status.success() => String::from_utf8(out.stdout)
+                .map(|s| s.trim().to_string())
+                .map_err(|e| format!("claude output is not UTF-8: {e}")),
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                Err(format!("claude exited with code {:?}: {stderr}", out.status.code()))
+                Err(format!(
+                    "claude exited with code {:?}: {stderr}",
+                    out.status.code()
+                ))
             }
             Err(e) => Err(format!("claude: {e}")),
         }
     };
 
     cmd
+}
+
+fn codex_failure(message: impl Into<String>) -> poll_cycle::CodexPollResult {
+    poll_cycle::CodexPollResult::Failure {
+        diagnostic: message.into(),
+    }
+}
+
+fn classify_codex_error(message: &str) -> poll_cycle::CodexPollResult {
+    codex_failure(poll_cycle::codex_failure_diagnostic(message))
+}
+
+const CODEX_EARLY_CLOSE: &str = "Codex app-server closed before returning rate limits.";
+const CODEX_STDERR_LIMIT: usize = 4096;
+
+#[derive(Clone, Default)]
+struct BoundedStderr {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl BoundedStderr {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes.lock().unwrap()).into_owned()
+    }
+}
+
+fn codex_exit_diagnostic(status: Option<std::process::ExitStatus>, stderr: &str) -> String {
+    let context = format!("{:?} {}", status.map(|s| s.code()), stderr).to_ascii_lowercase();
+    if context.contains("login") || context.contains("auth") || context.contains("unauthorized") {
+        "Codex login required: run `codex login`.".into()
+    } else if context.contains("method not found")
+        || context.contains("unknown method")
+        || context.contains("unsupported")
+        || context.contains("protocol")
+        || context.contains("version")
+    {
+        "Codex CLI update required for rate-limit monitoring.".into()
+    } else {
+        let code = status
+            .and_then(|status| status.code())
+            .map(|code| format!(" (exit code {code})"))
+            .unwrap_or_default();
+        format!("Codex app-server exited before returning rate limits{code}.")
+    }
+}
+
+fn finish_codex_child(
+    child: &mut std::process::Child,
+    stderr: &BoundedStderr,
+    stderr_thread: Option<std::thread::JoinHandle<()>>,
+) -> Option<std::process::ExitStatus> {
+    let status = match child.try_wait() {
+        Ok(Some(status)) => Some(status),
+        Ok(None) => {
+            let _ = child.kill();
+            child.wait().ok()
+        }
+        Err(_) => child.wait().ok(),
+    };
+    if let Some(thread) = stderr_thread {
+        let _ = thread.join();
+    }
+    // Keep this diagnostic bounded even when it is written to the process log.
+    let stderr_text = stderr.text();
+    if !stderr_text.is_empty() {
+        eprintln!(
+            "[monitor] codex app-server stderr ({} bytes captured)",
+            stderr_text.len()
+        );
+    }
+    status
+}
+
+fn receive_codex_response(
+    line_rx: &std::sync::mpsc::Receiver<String>,
+    expected_id: u64,
+    deadline: std::time::Instant,
+) -> Result<serde_json::Value, poll_cycle::CodexPollResult> {
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(codex_failure("Codex rate-limit request timed out."));
+        }
+        match line_rx.recv_timeout(remaining) {
+            Ok(line) => match serde_json::from_str::<serde_json::Value>(&line) {
+                Ok(value) if value.get("id") == Some(&serde_json::json!(expected_id)) => {
+                    if value.get("error").is_some() {
+                        let message = value["error"]["message"].as_str().unwrap_or_default();
+                        return Err(classify_codex_error(message));
+                    }
+                    return Ok(value);
+                }
+                Ok(_) | Err(_) => {}
+            },
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(codex_failure("Codex rate-limit request timed out."));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(codex_failure(CODEX_EARLY_CLOSE));
+            }
+        }
+    }
+}
+
+fn run_codex_command() -> poll_cycle::CodexPollResult {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let candidates = if cfg!(target_os = "windows") {
+        vec!["codex.cmd", "codex"]
+    } else {
+        vec!["codex"]
+    };
+    let mut last_error = None;
+
+    for name in candidates {
+        let mut command = std::process::Command::new(name);
+        command
+            .args(["app-server"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                last_error = Some(codex_failure("Codex CLI not found on PATH."));
+                continue;
+            }
+            Err(error) => return codex_failure(format!("Codex CLI could not start: {error}")),
+        };
+        let mut stdin = child.stdin.take().expect("Codex stdin was piped");
+        let stdout = child.stdout.take().expect("Codex stdout was piped");
+        let stderr = child.stderr.take().expect("Codex stderr was piped");
+        let bounded_stderr = BoundedStderr::default();
+        let stderr_capture = bounded_stderr.clone();
+        let stderr_thread = std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stderr);
+            let mut chunk = [0u8; 512];
+            loop {
+                let count = match reader.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => count,
+                };
+                let mut bytes = stderr_capture.bytes.lock().unwrap();
+                let remaining = CODEX_STDERR_LIMIT.saturating_sub(bytes.len());
+                bytes.extend_from_slice(&chunk[..count.min(remaining)]);
+            }
+        });
+        let (line_tx, line_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines().flatten() {
+                if line_tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let initialize = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": { "name": "claude-deepseek-monitor", "version": "0.2.1" }
+            }
+        });
+        let initialized = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        });
+        let read_limits = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "account/rateLimits/read",
+            "params": {}
+        });
+        let write_request = |request: &serde_json::Value, stdin: &mut std::process::ChildStdin| {
+            writeln!(stdin, "{}", request).and_then(|_| stdin.flush())
+        };
+        if write_request(&initialize, &mut stdin).is_err() {
+            let _ = finish_codex_child(&mut child, &bounded_stderr, Some(stderr_thread));
+            return codex_failure("Codex app-server request failed.");
+        }
+        let initialize_response = match receive_codex_response(&line_rx, 1, deadline) {
+            Ok(response) => response,
+            Err(failure) => {
+                let status = finish_codex_child(&mut child, &bounded_stderr, Some(stderr_thread));
+                return if matches!(&failure, poll_cycle::CodexPollResult::Failure { diagnostic } if diagnostic == CODEX_EARLY_CLOSE)
+                {
+                    codex_failure(codex_exit_diagnostic(status, &bounded_stderr.text()))
+                } else {
+                    failure
+                };
+            }
+        };
+        if !poll_cycle::has_codex_initialize_result(&initialize_response) {
+            let _ = finish_codex_child(&mut child, &bounded_stderr, Some(stderr_thread));
+            return codex_failure("Codex protocol capability response is incompatible.");
+        }
+        if write_request(&initialized, &mut stdin)
+            .and_then(|_| write_request(&read_limits, &mut stdin))
+            .is_err()
+        {
+            let _ = finish_codex_child(&mut child, &bounded_stderr, Some(stderr_thread));
+            return codex_failure("Codex app-server request failed.");
+        }
+
+        let response = match receive_codex_response(&line_rx, 2, deadline) {
+            Ok(response) => response,
+            Err(failure) => {
+                let status = finish_codex_child(&mut child, &bounded_stderr, Some(stderr_thread));
+                return if matches!(&failure, poll_cycle::CodexPollResult::Failure { diagnostic } if diagnostic == CODEX_EARLY_CLOSE)
+                {
+                    codex_failure(codex_exit_diagnostic(status, &bounded_stderr.text()))
+                } else {
+                    failure
+                };
+            }
+        };
+        drop(stdin);
+        let _ = finish_codex_child(&mut child, &bounded_stderr, Some(stderr_thread));
+        return match poll_cycle::parse_codex_response(&response) {
+            Ok(result) => result,
+            Err(message) => classify_codex_error(&message),
+        };
+    }
+
+    last_error.unwrap_or_else(|| codex_failure("Codex CLI not found on PATH."))
 }
 
 /// Runs one poll cycle and returns whether it succeeded (used by the poll
@@ -231,77 +572,139 @@ fn run_poll_cycle(app: &tauri::AppHandle) -> bool {
     let fixed_offset = *local_now.offset();
     let current_time = local_now.with_timezone(&fixed_offset);
 
-    let config = settings_to_config(&load_settings(app));
+    let settings = load_settings(app);
+    let config = settings_to_config(&settings);
+    let codex_enabled = settings.enable_codex;
+    let claude_enabled = settings.enable_claude;
 
     let state_container = app.state::<Mutex<AppState>>();
-    let mut state_lock = state_container.lock().unwrap();
+    let previous_state = {
+        let mut state_lock = state_container.lock().unwrap();
+        let settings_generation = state_lock.settings_generation;
+        if codex_enabled && !state_lock.poll_cycle_state.codex.enabled {
+            state_lock.poll_cycle_state.codex = poll_cycle::CodexState {
+                enabled: true,
+                loading: true,
+                ..Default::default()
+            };
+            let loading_state = state_lock.poll_cycle_state.clone();
+            emit_state_update(app, &loading_state);
+        }
+        if claude_enabled && !state_lock.poll_cycle_state.claude.enabled {
+            state_lock.poll_cycle_state.claude = poll_cycle::ClaudeState {
+                enabled: true,
+                ..Default::default()
+            };
+        }
+        (state_lock.poll_cycle_state.clone(), settings_generation)
+    };
+    let (previous_state, settings_generation) = previous_state;
 
-    // The claude CLI occasionally returns a malformed/incomplete response on its
-    // first invocation right after the app cold-starts (auth/session warmup),
-    // then succeeds immediately after. Retry once before surfacing a diagnostic,
-    // rather than showing a scary error for a whole poll interval.
-    const MAX_ATTEMPTS: u32 = 2;
-    let mut attempt = 1;
-    let (mut new_state, events, raw_text, cmd_diagnostic) = loop {
-        let (raw_text, cmd_diagnostic) = match run_claude_command() {
-            Ok(text) => {
-                eprintln!("[monitor] claude OK, {} bytes received", text.len());
-                (Some(text), None)
-            }
-            Err(diag) => {
-                eprintln!("[monitor] claude FAIL: {diag}");
-                (None, Some(diag))
-            }
-        };
-
-        eprintln!("[monitor] running poll_cycle() (attempt {attempt})");
+    #[allow(unused_mut, unused_variables)]
+    let (mut new_state, events, _raw_text, _cmd_diagnostic) = if !claude_enabled {
+        let codex_enabled_now = load_settings(app).enable_codex;
         let (new_state, events) = poll_cycle::poll_cycle(
-            raw_text.as_deref(),
+            None,
             &current_time,
             &config,
-            &state_lock.poll_cycle_state,
+            &previous_state,
+            false,
+            codex_enabled_now,
+            None,
         );
-
-        eprintln!("[monitor] poll_cycle done, events={}, stale={}, session_pct={:?}, week_pct={:?}",
-            events.len(), new_state.stale, new_state.session_used_pct, new_state.week_used_pct);
-
-        let parse_failed = raw_text.is_some()
-            && new_state.stale
-            && new_state.session_used_pct.is_none();
-
-        if parse_failed && attempt < MAX_ATTEMPTS {
-            eprintln!("[monitor] parse failed on attempt {attempt}, retrying claude command");
-            attempt += 1;
-            continue;
-        }
-
-        break (new_state, events, raw_text, cmd_diagnostic);
-    };
-
-    // If the subprocess ran but parsing failed, show the raw output as diagnostic
-    if let Some(ref text) = raw_text {
-        if new_state.stale && new_state.session_used_pct.is_none() {
-            let preview: String = text.chars().take(200).collect();
-            eprintln!("[monitor] PARSE FAILED. Raw output (200 chars):\n---\n{preview}\n---");
-            new_state.diagnostic = Some(format!("Unexpected output: {preview}"));
-        }
-    }
-
-    if let Some(diag) = cmd_diagnostic {
-        new_state.diagnostic = Some(diag);
-    }
-
-    let succeeded = new_state.diagnostic.is_none();
-    state_lock.consecutive_failures = if succeeded {
-        0
+        (new_state, events, None::<String>, None::<String>)
     } else {
-        state_lock.consecutive_failures + 1
+        const MAX_ATTEMPTS: u32 = 2;
+        let mut attempt = 1;
+        let (mut new_state, events, raw_text, cmd_diagnostic) = loop {
+            let codex_thread = if codex_enabled {
+                Some(std::thread::spawn(run_codex_command))
+            } else {
+                None
+            };
+            let (raw_text, cmd_diagnostic) = match run_claude_command() {
+                Ok(text) => {
+                    eprintln!("[monitor] claude OK, {} bytes received", text.len());
+                    (Some(text), None)
+                }
+                Err(diag) => {
+                    eprintln!("[monitor] claude FAIL: {diag}");
+                    (None, Some(diag))
+                }
+            };
+
+            eprintln!("[monitor] running poll_cycle() (attempt {attempt})");
+            let codex_result = match codex_thread {
+                Some(thread) => Some(
+                    thread
+                        .join()
+                        .unwrap_or_else(|_| codex_failure("Codex poll worker failed.")),
+                ),
+                None => None,
+            };
+            let codex_enabled_now = load_settings(app).enable_codex;
+            let claude_enabled_now = load_settings(app).enable_claude;
+            let (new_state, events) = poll_cycle::poll_cycle(
+                raw_text.as_deref(),
+                &current_time,
+                &config,
+                &previous_state,
+                claude_enabled_now,
+                codex_enabled_now,
+                codex_result.as_ref(),
+            );
+
+            eprintln!(
+                "[monitor] poll_cycle done, events={}, stale={}, session_pct={:?}, week_pct={:?}",
+                events.len(),
+                new_state.claude.stale,
+                new_state.claude.session_used_pct,
+                new_state.claude.week_used_pct
+            );
+
+            let parse_failed = raw_text.is_some()
+                && new_state.claude.stale
+                && new_state.claude.session_used_pct.is_none();
+
+            if parse_failed && attempt < MAX_ATTEMPTS {
+                eprintln!("[monitor] parse failed on attempt {attempt}, retrying claude command");
+                attempt += 1;
+                continue;
+            }
+
+            break (new_state, events, raw_text, cmd_diagnostic);
+        };
+
+        if let Some(ref text) = raw_text {
+            if new_state.claude.stale && new_state.claude.session_used_pct.is_none() {
+                let preview: String = text.chars().take(200).collect();
+                eprintln!("[monitor] PARSE FAILED. Raw output (200 chars):\n---\n{preview}\n---");
+                new_state.claude.diagnostic = Some(format!("Unexpected output: {preview}"));
+            }
+        }
+
+        if let Some(diag) = cmd_diagnostic {
+            new_state.claude.diagnostic = Some(diag);
+        }
+
+        (new_state, events, raw_text, None::<String>)
     };
 
+    let succeeded = new_state.claude.diagnostic.is_none() || !claude_enabled;
     let display_state = new_state.clone();
-    state_lock.poll_cycle_state = new_state;
-    drop(state_lock);
-    drop(state_container);
+    {
+        let mut state_lock = state_container.lock().unwrap();
+        if state_lock.settings_generation != settings_generation {
+            eprintln!("[monitor] settings changed during poll; discarding late cycle");
+            return state_lock.poll_cycle_state.claude.diagnostic.is_none();
+        }
+        state_lock.consecutive_failures = if succeeded {
+            0
+        } else {
+            state_lock.consecutive_failures + 1
+        };
+        state_lock.poll_cycle_state = new_state;
+    }
 
     eprintln!("[monitor] firing notifications and emitting state");
     fire_notifications(app, &events);
@@ -329,39 +732,62 @@ fn get_settings(app: tauri::AppHandle) -> serde_json::Value {
         "under_pace_threshold": settings.under_pace_threshold,
         "over_pace_threshold": settings.over_pace_threshold,
         "widget_opacity": settings.widget_opacity,
+        "enable_codex": settings.enable_codex,
+        "enable_claude": settings.enable_claude,
     })
 }
 
 #[tauri::command]
 fn save_settings(app: tauri::AppHandle, settings: serde_json::Value) -> Result<(), String> {
-    let auto_launch = settings.get("auto_launch").and_then(|v| v.as_bool()).unwrap_or(true);
-    let windows = settings.get("deepseek_windows").and_then(|v| v.as_array()).map(|arr| {
-        arr.iter().filter_map(|w| {
-            Some(WindowConfig {
-                start_hour: w.get("start_hour")?.as_u64()? as u8,
-                end_hour: w.get("end_hour")?.as_u64()? as u8,
-            })
-        }).collect::<Vec<_>>()
-    }).unwrap_or_default();
-    let poll_interval_minutes = settings.get("poll_interval_minutes")
+    let auto_launch = settings
+        .get("auto_launch")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let windows = settings
+        .get("deepseek_windows")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|w| {
+                    Some(WindowConfig {
+                        start_hour: w.get("start_hour")?.as_u64()? as u8,
+                        end_hour: w.get("end_hour")?.as_u64()? as u8,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let poll_interval_minutes = settings
+        .get("poll_interval_minutes")
         .and_then(|v| v.as_u64())
         .map(|v| (v as u32).max(1))
         .unwrap_or_else(default_poll_interval_minutes);
 
-    let under_pace_threshold = settings.get("under_pace_threshold")
+    let under_pace_threshold = settings
+        .get("under_pace_threshold")
         .and_then(|v| v.as_u64())
         .map(|v| (v as u32).clamp(1, 20))
         .unwrap_or_else(default_under_pace_threshold);
 
-    let over_pace_threshold = settings.get("over_pace_threshold")
+    let over_pace_threshold = settings
+        .get("over_pace_threshold")
         .and_then(|v| v.as_u64())
         .map(|v| (v as u32).clamp(1, 20))
         .unwrap_or_else(default_over_pace_threshold);
 
-    let widget_opacity = settings.get("widget_opacity")
+    let widget_opacity = settings
+        .get("widget_opacity")
         .and_then(|v| v.as_f64())
         .map(|v| v.clamp(0.3, 1.0))
         .unwrap_or_else(default_widget_opacity);
+    let enable_codex = settings
+        .get("enable_codex")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let enable_claude = settings
+        .get("enable_claude")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     let saved = SavedSettings {
         deepseek_windows: windows,
@@ -370,13 +796,33 @@ fn save_settings(app: tauri::AppHandle, settings: serde_json::Value) -> Result<(
         under_pace_threshold,
         over_pace_threshold,
         widget_opacity,
+        enable_codex,
+        enable_claude,
     };
+
+    {
+        let state = app.state::<Mutex<AppState>>();
+        let mut state = state.lock().unwrap();
+        state.settings_generation = state.settings_generation.saturating_add(1);
+    }
 
     save_settings_to_disk(&app, &saved);
 
     {
         let state = app.state::<Mutex<AppState>>();
-        let current = state.lock().unwrap().poll_cycle_state.clone();
+        let current = {
+            let mut state = state.lock().unwrap();
+            if !enable_codex {
+                state.poll_cycle_state.codex = poll_cycle::CodexState::default();
+            }
+            if !enable_claude {
+                state.poll_cycle_state.claude = poll_cycle::ClaudeState {
+                    enabled: false,
+                    ..Default::default()
+                };
+            }
+            state.poll_cycle_state.clone()
+        };
         emit_state_update(&app, &current);
     }
 
@@ -390,6 +836,8 @@ fn save_settings(app: tauri::AppHandle, settings: serde_json::Value) -> Result<(
         }
     }
 
+    run_poll_cycle(&app);
+
     Ok(())
 }
 
@@ -402,24 +850,31 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![]),
         ))
-        .plugin(tauri_plugin_window_state::Builder::default()
-            .with_state_flags(tauri_plugin_window_state::StateFlags::POSITION)
-            .with_denylist(&["settings"])
-            .build())
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(tauri_plugin_window_state::StateFlags::POSITION)
+                .with_denylist(&["settings"])
+                .build(),
+        )
         .manage(Mutex::new(AppState {
             poll_cycle_state: poll_cycle::DisplayState::default(),
             consecutive_failures: 0,
+            settings_generation: 0,
         }))
         .manage(Mutex::new(None::<PollThreadControl>))
-        .invoke_handler(tauri::generate_handler![get_settings, save_settings, get_initial_state])
+        .invoke_handler(tauri::generate_handler![
+            get_settings,
+            save_settings,
+            get_initial_state,
+            resize_widget
+        ])
         .setup(|app| {
             let icon_image = Image::from_bytes(include_bytes!("../icons/32x32.png"))
                 .expect("failed to decode tray icon");
 
             let settings_item =
                 tauri::menu::MenuItemBuilder::with_id("settings", "Settings").build(app)?;
-            let quit_item =
-                tauri::menu::MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+            let quit_item = tauri::menu::MenuItemBuilder::with_id("quit", "Quit").build(app)?;
             let menu = Menu::with_items(app, &[&settings_item, &quit_item])?;
 
             // Apply autostart from saved settings
@@ -432,7 +887,7 @@ pub fn run() {
 
             TrayIconBuilder::new()
                 .icon(icon_image)
-                .tooltip("Claude / DeepSeek Monitor")
+                .tooltip("Claude / Codex / DeepSeek Monitor")
                 .menu(&menu)
                 .on_tray_icon_event(move |tray, event| {
                     let app = tray.app_handle();
@@ -460,7 +915,7 @@ pub fn run() {
                             WebviewUrl::App("settings.html".into()),
                         )
                         .title("Settings")
-                        .inner_size(320.0, 360.0)
+                        .inner_size(320.0, 390.0)
                         .resizable(false)
                         .build();
                     }
@@ -481,16 +936,19 @@ pub fn run() {
                         width: size.width,
                         height: size.height,
                     };
-                    let monitor_rects: Vec<poll_cycle::Rect> = monitors.iter().map(|m| {
-                        let mpos = m.position();
-                        let msize = m.size();
-                        poll_cycle::Rect {
-                            x: mpos.x,
-                            y: mpos.y,
-                            width: msize.width,
-                            height: msize.height,
-                        }
-                    }).collect();
+                    let monitor_rects: Vec<poll_cycle::Rect> = monitors
+                        .iter()
+                        .map(|m| {
+                            let mpos = m.position();
+                            let msize = m.size();
+                            poll_cycle::Rect {
+                                x: mpos.x,
+                                y: mpos.y,
+                                width: msize.width,
+                                height: msize.height,
+                            }
+                        })
+                        .collect();
                     if !poll_cycle::is_position_visible(&window_rect, &monitor_rects) {
                         if let Some(primary) = app.primary_monitor().unwrap_or(None) {
                             let ppos = primary.position();
@@ -517,7 +975,10 @@ pub fn run() {
             let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
             *app.state::<Mutex<Option<PollThreadControl>>>()
                 .lock()
-                .unwrap() = Some(PollThreadControl { shutdown_tx, done_rx });
+                .unwrap() = Some(PollThreadControl {
+                shutdown_tx,
+                done_rx,
+            });
 
             let handle = app.handle().clone();
             std::thread::spawn(move || {
@@ -567,5 +1028,116 @@ fn signal_poll_thread_shutdown(app: &tauri::AppHandle) {
     if let Some(control) = guard.as_ref() {
         let _ = control.shutdown_tx.send(());
         let _ = control.done_rx.recv_timeout(Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn state_serialization_exposes_optional_codex_contract_without_global_stale_state() {
+        let state = poll_cycle::DisplayState {
+            claude: poll_cycle::ClaudeState {
+                stale: false,
+                ..Default::default()
+            },
+            codex: poll_cycle::CodexState {
+                enabled: true,
+                loading: false,
+                available: true,
+                stale: true,
+                diagnostic: Some("Codex rate-limit poll failed.".into()),
+                primary: Some(poll_cycle::CodexWindowState {
+                    label: "5-hour".into(),
+                    used_pct: 42.0,
+                    reset_time_text: Some("later".into()),
+                    pacing: Some(poll_cycle::Pacing::OnPace),
+                }),
+                windows: vec![],
+            },
+            ..Default::default()
+        };
+        let json = state_to_json(&state, 0.92);
+
+        assert_eq!(json["codex_enabled"], true);
+        assert_eq!(json["codex_stale"], true);
+        assert_eq!(json["codex_diagnostic"], "Codex rate-limit poll failed.");
+        assert_eq!(json["codex_primary"]["label"], "5-hour");
+        assert_eq!(json["stale"], false);
+    }
+
+    #[test]
+    fn codex_current_transcript_ignores_notifications_before_matching_response() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(r#"{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"codex"}}}"#.into())
+            .unwrap();
+        let initialize =
+            receive_codex_response(&rx, 1, std::time::Instant::now() + Duration::from_secs(1))
+                .unwrap();
+        assert!(poll_cycle::has_codex_initialize_result(&initialize));
+        tx.send(r#"{"jsonrpc":"2.0","method":"account/updated","params":{}}"#.into())
+            .unwrap();
+        tx.send(r#"{"jsonrpc":"2.0","id":2,"result":{"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":25.0,"windowDurationMins":300}}}}}"#.into())
+            .unwrap();
+        let response =
+            receive_codex_response(&rx, 2, std::time::Instant::now() + Duration::from_secs(1))
+                .unwrap();
+        assert!(matches!(
+            poll_cycle::parse_codex_response(&response),
+            Ok(poll_cycle::CodexPollResult::Success { .. })
+        ));
+    }
+
+    #[test]
+    fn codex_error_response_keeps_authentication_diagnostic() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"authentication required"}}"#.into())
+            .unwrap();
+        let result =
+            receive_codex_response(&rx, 2, std::time::Instant::now() + Duration::from_secs(1));
+        assert!(
+            matches!(result, Err(poll_cycle::CodexPollResult::Failure { diagnostic }) if diagnostic.contains("login"))
+        );
+    }
+
+    #[test]
+    fn codex_timeout_is_distinct_from_early_exit() {
+        let (_tx, rx) = mpsc::channel::<String>();
+        let result = receive_codex_response(&rx, 2, std::time::Instant::now());
+        assert!(
+            matches!(result, Err(poll_cycle::CodexPollResult::Failure { diagnostic }) if diagnostic.contains("timed out"))
+        );
+        assert!(codex_exit_diagnostic(None, "unexpected shutdown").contains("exited before"));
+    }
+
+    #[test]
+    fn codex_early_exit_classifies_bounded_stderr_without_exposing_it() {
+        let diagnostic =
+            codex_exit_diagnostic(None, "fatal: authentication required; token=secret");
+        assert_eq!(diagnostic, "Codex login required: run `codex login`.");
+        assert!(!diagnostic.contains("secret"));
+    }
+
+    #[test]
+    fn settings_without_enable_claude_defaults_to_true() {
+        let json = r#"{"deepseek_windows":[],"auto_launch":false,"poll_interval_minutes":5,"under_pace_threshold":1,"over_pace_threshold":1,"widget_opacity":0.9,"enable_codex":false}"#;
+        let settings: SavedSettings = serde_json::from_str(json).unwrap();
+        assert!(settings.enable_claude, "missing enable_claude must default to true");
+    }
+
+    #[test]
+    fn settings_with_enable_claude_false_parses_correctly() {
+        let json = r#"{"deepseek_windows":[],"auto_launch":false,"poll_interval_minutes":5,"under_pace_threshold":1,"over_pace_threshold":1,"widget_opacity":0.9,"enable_codex":false,"enable_claude":false}"#;
+        let settings: SavedSettings = serde_json::from_str(json).unwrap();
+        assert!(!settings.enable_claude);
+    }
+
+    #[test]
+    fn settings_with_enable_claude_true_parses_correctly() {
+        let json = r#"{"deepseek_windows":[],"auto_launch":false,"poll_interval_minutes":5,"under_pace_threshold":1,"over_pace_threshold":1,"widget_opacity":0.9,"enable_codex":false,"enable_claude":true}"#;
+        let settings: SavedSettings = serde_json::from_str(json).unwrap();
+        assert!(settings.enable_claude);
     }
 }
